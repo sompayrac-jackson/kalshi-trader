@@ -367,17 +367,46 @@ def api_signals():
 @app.route("/api/positions")
 @_require_auth
 def api_positions():
-    if not POSITIONS_FILE.exists():
-        return jsonify([])
-    seen: dict = {}
-    for line in POSITIONS_FILE.read_text(encoding="utf-8").splitlines():
-        try:
-            p = json.loads(line)
-            if p.get("status") == "open":
-                seen[p["ticker"]] = p
-        except Exception:
-            pass
-    return jsonify(list(seen.values()))
+    try:
+        raw = client.get_positions().get("market_positions", [])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Build player/entry-price lookup from live orders (first order per ticker)
+    order_meta: dict = {}
+    if ORDERS_LIVE_FILE.exists():
+        for line in ORDERS_LIVE_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                o = json.loads(line)
+                t = o.get("ticker", "")
+                if t and t not in order_meta:
+                    order_meta[t] = {
+                        "player":      o.get("player", ""),
+                        "price_cents": o.get("price_cents", 0),
+                        "opened_at":   o.get("ts", ""),
+                        "source":      o.get("source", "live"),
+                    }
+            except Exception:
+                pass
+
+    positions = []
+    for p in raw:
+        ticker    = p.get("ticker", "")
+        contracts = int(float(p.get("position_fp", 0)))
+        cost_usd  = float(p.get("market_exposure_dollars", 0))
+        if contracts <= 0:
+            continue
+        meta = order_meta.get(ticker, {})
+        positions.append({
+            "ticker":      ticker,
+            "player":      meta.get("player", ticker),
+            "contracts":   contracts,
+            "price_cents": meta.get("price_cents", 0),
+            "cost_usd":    cost_usd,
+            "source":      meta.get("source", "live"),
+            "opened_at":   meta.get("opened_at", ""),
+        })
+    return jsonify(positions)
 
 
 @app.route("/api/orders")
