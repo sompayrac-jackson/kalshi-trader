@@ -857,11 +857,25 @@ def api_performance():
             and o.get("status") in ("submitted", "resting", "filled")
         ]
 
-    # Load and refresh resolution cache
+    # Load exits — these take priority over settlement for resolving orders
+    exits_by_ticker: dict[str, dict] = {}
+    ef = _exits_file(mode)
+    if ef.exists():
+        for line in ef.read_text(encoding="utf-8").splitlines():
+            try:
+                x = json.loads(line)
+                t = x.get("ticker", "")
+                if t and t not in exits_by_ticker and x.get("status") in ("dry_run", "submitted", "resting", "filled"):
+                    exits_by_ticker[t] = x
+            except Exception:
+                pass
+
+    # Load and refresh settlement cache for non-exited orders
     perf_cache = _load_perf_cache(mode)
     unresolved_tickers = {
         o["ticker"] for o in candidates
-        if o["ticker"] not in perf_cache
+        if o["ticker"] not in exits_by_ticker
+        and o["ticker"] not in perf_cache
     }
 
     if unresolved_tickers:
@@ -876,22 +890,42 @@ def api_performance():
                 pass
         _save_perf_cache(perf_cache, mode)
 
-    virtual = candidates  # rename for clarity below
-
     # Build resolved / pending lists
     resolved_orders: list[dict] = []
     pending_orders:  list[dict] = []
 
-    for o in virtual:
-        result = perf_cache.get(o["ticker"])
-        if result:
-            side = o.get("side", "yes")
-            won  = (side == "yes" and result == "yes") or \
-                   (side == "no"  and result == "no")
-            # cost_usd already accounts for side (see order_executor.py)
-            cost = o.get("cost_usd", 0)
-            pnl  = (o["contracts"] - cost) if won else -cost
-            resolved_orders.append({**o, "result": result, "won": won, "pnl": round(pnl, 2)})
+    for o in candidates:
+        ticker = o.get("ticker", "")
+
+        if ticker in exits_by_ticker:
+            # Resolved via exit (stop-loss, profit-take, or manual sell)
+            x      = exits_by_ticker[ticker]
+            pnl    = round(x.get("pnl_usd", 0), 2)
+            won    = pnl > 0
+            reason = x.get("reason", "exited")
+            resolved_orders.append({
+                **o,
+                "result":      reason,
+                "result_type": "exit",
+                "exit_cents":  x.get("exit_cents"),
+                "won":         won,
+                "pnl":         pnl,
+            })
+        elif perf_cache.get(ticker):
+            # Resolved via Kalshi market settlement
+            result = perf_cache[ticker]
+            side   = o.get("side", "yes")
+            won    = (side == "yes" and result == "yes") or \
+                     (side == "no"  and result == "no")
+            cost   = o.get("cost_usd", 0)
+            pnl    = round((o["contracts"] - cost) if won else -cost, 2)
+            resolved_orders.append({
+                **o,
+                "result":      result,
+                "result_type": "settlement",
+                "won":         won,
+                "pnl":         pnl,
+            })
         else:
             pending_orders.append(o)
 
@@ -1376,6 +1410,15 @@ function fmtTime(iso) {
   return new Date(iso).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 }
 function edgeCls(e) { return e > 0 ? 'green' : (e < 0 ? 'red' : 'dim'); }
+function fmtResult(o) {
+  const won = o.won;
+  if (o.result_type === 'exit') {
+    const labels = {stop_loss:'STOP-LOSS', profit_take:'PROFIT-TAKE', manual:'MANUAL SELL'};
+    const label  = labels[o.result] || o.result.toUpperCase();
+    return label + ' ' + (won ? 'PROFIT' : 'LOSS');
+  }
+  return (o.result || '').toUpperCase() + ' ' + (won ? 'WIN' : 'LOSS');
+}
 
 // ── Status ─────────────────────────────────────────────────────────────────
 let _config = {};
@@ -1891,7 +1934,7 @@ async function loadPerformance() {
         <td>${o.contracts}</td>
         <td>$${(o.cost_usd||0).toFixed(2)}</td>
         <td class="${o.edge>0?'green':'red'}">${pct(o.edge)}</td>
-        <td style="color:${won?'#00ff88':'#ff6b6b'}">${o.result.toUpperCase()} ${won?'WIN':'LOSS'}</td>
+        <td style="color:${won?'#00ff88':'#ff6b6b'}">${fmtResult(o)}</td>
         <td style="color:${pnlPos2?'#00ff88':'#ff6b6b'};font-weight:bold">${pnlPos2?'+':''}$${o.pnl.toFixed(2)}</td>
         <td><span class="src ${o.source}">${o.source}</span></td>
       </tr>`;
