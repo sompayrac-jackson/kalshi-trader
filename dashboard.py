@@ -1,0 +1,732 @@
+"""
+Kalshi Trader Dashboard.
+
+Flask web interface: signals feed, positions, order history, runner controls.
+
+Usage:
+    pip install flask
+    python dashboard.py              # default port 5000
+    python dashboard.py --port 8080  # custom port
+"""
+
+import hmac
+import json
+import threading
+import time
+import argparse
+from dataclasses import asdict
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template_string, request, Response
+
+import config
+from kalshi_client import KalshiClient
+from live_scanner import scan_live
+import order_executor as executor
+
+try:
+    from arb_scanner import scan as arb_scan
+    HAS_ARB = True
+except ImportError:
+    HAS_ARB = False
+
+KALSHI_API_KEY = config.KALSHI_API_KEY
+ODDS_API_KEY   = config.ODDS_API_KEY
+POSITIONS_FILE = Path("positions.jsonl")
+ORDERS_FILE    = Path("orders.jsonl")
+
+app = Flask(__name__)
+
+
+# ── HTTP Basic Auth ───────────────────────────────────────────────────────────
+
+def _check_auth(username: str, password: str) -> bool:
+    if not config.DASHBOARD_PASS:
+        return True  # auth disabled — dev mode only
+    ok_user = hmac.compare_digest(username.encode(), config.DASHBOARD_USER.encode())
+    ok_pass = hmac.compare_digest(password.encode(), config.DASHBOARD_PASS.encode())
+    return ok_user and ok_pass
+
+
+def _require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not config.DASHBOARD_PASS:
+            return f(*args, **kwargs)
+        auth = request.authorization
+        if not auth or not _check_auth(auth.username, auth.password):
+            return Response(
+                "Authentication required.",
+                401,
+                {"WWW-Authenticate": 'Basic realm="Kalshi Trader"'},
+            )
+        return f(*args, **kwargs)
+    return decorated
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+
+_lock       = threading.Lock()
+_stop_event = threading.Event()
+_scan_thread: threading.Thread | None = None
+_client: KalshiClient | None = None
+
+_state: dict = {
+    "running":        False,
+    "dry_run":        True,
+    "last_live_scan": None,
+    "last_arb_scan":  None,
+    "signals":        [],
+    "log":            [],
+    "config": {
+        "min_edge":          0.04,
+        "max_bet_usd":       25.0,
+        "kelly_fraction":    0.5,
+        "arb_interval_sec":  300,
+        "live_interval_sec": 30,
+    },
+}
+
+
+# ── Scanner background thread ─────────────────────────────────────────────────
+
+def _log(msg: str):
+    ts   = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    with _lock:
+        _state["log"].append(line)
+        if len(_state["log"]) > 300:
+            _state["log"] = _state["log"][-300:]
+
+
+def _to_dict(sig, source: str) -> dict:
+    d = asdict(sig)
+    d["source"]    = source
+    d["direction"] = "BUY" if sig.edge > 0 else "SKIP"
+    d["ts"]        = datetime.now(timezone.utc).isoformat()
+    # Normalise field names so the frontend only needs one code path
+    if "book_prob" in d and "model_prob" not in d:
+        d["model_prob"] = d["book_prob"]
+    if "score_state" not in d:
+        d["score_state"] = d.get("bookmaker", "")
+    if "sport" not in d:
+        d["sport"] = "arb"
+    return d
+
+
+def _scanner_loop():
+    global _client
+    _client  = KalshiClient(api_key_id=KALSHI_API_KEY)
+    last_arb = 0.0
+
+    while not _stop_event.is_set():
+        cfg = _state["config"]
+        now = time.time()
+        signals: list[dict] = []
+
+        # Arb scan (throttled)
+        if HAS_ARB and ODDS_API_KEY and (now - last_arb >= cfg["arb_interval_sec"]):
+            try:
+                _log("Running arb scan...")
+                for s in arb_scan(_client, ODDS_API_KEY):
+                    signals.append(_to_dict(s, "arb"))
+                last_arb = now
+                with _lock:
+                    _state["last_arb_scan"] = datetime.now(timezone.utc).isoformat()
+                _log(f"Arb scan done — {sum(1 for s in signals if s['source']=='arb')} signals")
+            except Exception as e:
+                _log(f"Arb scan error: {e}")
+
+        # Live scan
+        try:
+            _log("Running live scan...")
+            live = scan_live(_client)
+            for s in live:
+                signals.append(_to_dict(s, "live"))
+            with _lock:
+                _state["signals"]        = signals
+                _state["last_live_scan"] = datetime.now(timezone.utc).isoformat()
+            _log(f"Live scan done — {len(live)} live signals")
+        except Exception as e:
+            _log(f"Live scan error: {e}")
+
+        _stop_event.wait(cfg["live_interval_sec"])
+
+
+# ── API endpoints ─────────────────────────────────────────────────────────────
+
+@app.route("/api/status")
+@_require_auth
+def api_status():
+    with _lock:
+        return jsonify({
+            "running":        _state["running"],
+            "dry_run":        _state["dry_run"],
+            "last_live_scan": _state["last_live_scan"],
+            "last_arb_scan":  _state["last_arb_scan"],
+            "config":         _state["config"],
+        })
+
+
+@app.route("/api/signals")
+@_require_auth
+def api_signals():
+    with _lock:
+        return jsonify(_state["signals"])
+
+
+@app.route("/api/positions")
+@_require_auth
+def api_positions():
+    if not POSITIONS_FILE.exists():
+        return jsonify([])
+    seen: dict = {}
+    for line in POSITIONS_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            p = json.loads(line)
+            if p.get("status") == "open":
+                seen[p["ticker"]] = p
+        except Exception:
+            pass
+    return jsonify(list(seen.values()))
+
+
+@app.route("/api/orders")
+@_require_auth
+def api_orders():
+    if not ORDERS_FILE.exists():
+        return jsonify([])
+    orders = []
+    for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            orders.append(json.loads(line))
+        except Exception:
+            pass
+    return jsonify(list(reversed(orders[-200:])))
+
+
+@app.route("/api/log")
+@_require_auth
+def api_log():
+    with _lock:
+        return jsonify(_state["log"][-150:])
+
+
+@app.route("/api/start", methods=["POST"])
+@_require_auth
+def api_start():
+    global _scan_thread
+    data    = request.get_json(silent=True) or {}
+    dry_run = data.get("dry_run", True)
+
+    with _lock:
+        if _state["running"]:
+            return jsonify({"ok": False, "error": "Already running"})
+        _state["running"] = True
+        _state["dry_run"] = dry_run
+    executor.DRY_RUN = dry_run
+
+    _stop_event.clear()
+    _scan_thread = threading.Thread(target=_scanner_loop, daemon=True, name="scanner")
+    _scan_thread.start()
+    _log(f"Scanner started  dry_run={dry_run}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/stop", methods=["POST"])
+@_require_auth
+def api_stop():
+    with _lock:
+        if not _state["running"]:
+            return jsonify({"ok": False, "error": "Not running"})
+        _state["running"] = False
+    _stop_event.set()
+    _log("Scanner stopped")
+    return jsonify({"ok": True})
+
+
+_CONFIG_BOUNDS = {
+    "min_edge":          (0.01, 0.50),
+    "max_bet_usd":       (1.0,  500.0),
+    "kelly_fraction":    (0.05, 1.0),
+    "arb_interval_sec":  (60,   3600),
+    "live_interval_sec": (10,   300),
+}
+
+@app.route("/api/config", methods=["POST"])
+@_require_auth
+def api_config():
+    data = request.get_json(silent=True) or {}
+    errors = []
+    updates = {}
+    for k, v in data.items():
+        if k not in _CONFIG_BOUNDS:
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            errors.append(f"{k}: not a number")
+            continue
+        lo, hi = _CONFIG_BOUNDS[k]
+        if not (lo <= v <= hi):
+            errors.append(f"{k}: {v} out of range [{lo}, {hi}]")
+            continue
+        updates[k] = v
+    if errors:
+        return jsonify({"ok": False, "errors": errors}), 400
+    with _lock:
+        _state["config"].update(updates)
+    if "min_edge"    in updates: executor.MIN_EDGE    = updates["min_edge"]
+    if "max_bet_usd" in updates: executor.MAX_BET_USD = updates["max_bet_usd"]
+    return jsonify({"ok": True, "config": _state["config"]})
+
+
+@app.route("/")
+@_require_auth
+def index():
+    return render_template_string(HTML)
+
+
+# ── HTML (single-page app) ────────────────────────────────────────────────────
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kalshi Trader</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0d0d0d;color:#e0e0e0;font-family:'Courier New',monospace;font-size:13px;min-height:100vh}
+
+  /* Header */
+  .hdr{background:#111;border-bottom:1px solid #2a2a2a;padding:12px 24px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:10}
+  .hdr h1{font-size:16px;color:#fff;letter-spacing:.05em}
+  .dot{width:10px;height:10px;border-radius:50%;background:#444;flex-shrink:0}
+  .dot.on{background:#00ff88;box-shadow:0 0 8px #00ff88}
+  .dot.off{background:#ff4444}
+  .badge{padding:3px 9px;border-radius:10px;font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+  .badge.dry{background:#2a2a2a;color:#888}
+  .badge.live{background:#ff4444;color:#fff}
+  .hdr-right{margin-left:auto;font-size:11px;color:#444}
+
+  /* Tabs */
+  .tabs{display:flex;background:#111;border-bottom:1px solid #2a2a2a}
+  .tab{padding:11px 22px;cursor:pointer;color:#555;border-bottom:2px solid transparent;font-size:12px;text-transform:uppercase;letter-spacing:.06em;transition:color .15s}
+  .tab.active{color:#00ff88;border-bottom-color:#00ff88}
+  .tab:hover:not(.active){color:#aaa}
+
+  /* Content */
+  .content{padding:20px 24px;max-width:1600px}
+  .panel{display:none}
+  .panel.active{display:block}
+
+  /* Stat cards */
+  .stats{display:flex;gap:14px;margin-bottom:20px;flex-wrap:wrap}
+  .card{background:#141414;border:1px solid #2a2a2a;border-radius:6px;padding:14px 20px;min-width:130px}
+  .card .lbl{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.06em}
+  .card .val{font-size:24px;color:#fff;margin-top:6px;font-weight:bold}
+  .card .val.green{color:#00ff88}
+  .card .val.yellow{color:#ffcc00}
+
+  /* Tables */
+  .tbl-wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;white-space:nowrap}
+  th{text-align:left;padding:8px 12px;color:#444;font-weight:normal;border-bottom:1px solid #222;font-size:10px;text-transform:uppercase;letter-spacing:.06em}
+  td{padding:9px 12px;border-bottom:1px solid #1a1a1a;vertical-align:middle}
+  tr:hover td{background:#161616}
+  .empty{color:#444;text-align:center;padding:40px;font-size:12px}
+
+  /* Colors */
+  .green{color:#00ff88}
+  .red{color:#ff6b6b}
+  .dim{color:#555}
+  .yellow{color:#ffcc00}
+  .buy{color:#00ff88;font-weight:bold}
+  .skip{color:#444}
+
+  /* Buttons */
+  .btn{padding:9px 18px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-family:inherit;letter-spacing:.04em;transition:opacity .15s}
+  .btn:hover{opacity:.85}
+  .btn:disabled{opacity:.3;cursor:not-allowed}
+  .btn-green{background:#00ff88;color:#000;font-weight:bold}
+  .btn-orange{background:#ff9900;color:#000;font-weight:bold}
+  .btn-red{background:#ff4444;color:#fff}
+  .btn-gray{background:#2a2a2a;color:#ccc}
+
+  /* Controls bar */
+  .controls{display:flex;gap:10px;align-items:center;margin-bottom:24px;flex-wrap:wrap}
+
+  /* Log terminal */
+  .log-box{background:#080808;border:1px solid #222;border-radius:4px;padding:12px;height:460px;overflow-y:auto;font-size:11.5px;color:#00cc66;line-height:1.6}
+  .log-box div:nth-child(odd){color:#009944}
+
+  /* Config form */
+  .cfg-row{display:flex;align-items:center;gap:16px;margin-bottom:18px}
+  .cfg-row label{color:#666;width:170px;font-size:12px}
+  .cfg-row input[type=range]{flex:1;max-width:220px;accent-color:#00ff88}
+  .cfg-row .cfg-val{color:#fff;width:70px;font-size:13px}
+  .cfg-section{color:#444;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px;margin-top:8px}
+
+  /* Status row in settings */
+  .setting-group{background:#141414;border:1px solid #2a2a2a;border-radius:6px;padding:18px 20px;margin-bottom:18px}
+  .setting-group h3{font-size:11px;color:#555;text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+
+  /* Source tag */
+  .src{font-size:10px;padding:2px 7px;border-radius:3px;background:#1e1e1e;color:#666}
+  .src.live{color:#00ff88;background:#001a0d}
+  .src.arb{color:#ffcc00;background:#1a1500}
+
+  /* Status badge */
+  .st{font-size:11px}
+  .st.dry_run{color:#888}
+  .st.submitted,.st.resting{color:#00ff88}
+  .st.skipped,.st.error{color:#ff6b6b}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="dot off" id="dot"></div>
+  <h1>KALSHI TRADER</h1>
+  <span class="badge dry" id="badge">DRY RUN</span>
+  <span class="hdr-right" id="lastScan"></span>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('signals')">Signals</div>
+  <div class="tab" onclick="showTab('positions')">Positions</div>
+  <div class="tab" onclick="showTab('orders')">Orders</div>
+  <div class="tab" onclick="showTab('log')">Log</div>
+  <div class="tab" onclick="showTab('settings')">Settings</div>
+</div>
+
+<div class="content">
+
+  <!-- SIGNALS -->
+  <div class="panel active" id="panel-signals">
+    <div class="stats">
+      <div class="card"><div class="lbl">Total Signals</div><div class="val" id="s-total">-</div></div>
+      <div class="card"><div class="lbl">BUY Signals</div><div class="val green" id="s-buys">-</div></div>
+      <div class="card"><div class="lbl">Best Edge</div><div class="val yellow" id="s-edge">-</div></div>
+      <div class="card"><div class="lbl">Live</div><div class="val" id="s-live">-</div></div>
+      <div class="card"><div class="lbl">Arb</div><div class="val" id="s-arb">-</div></div>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Player / Team</th><th>Sport</th><th>Src</th>
+          <th>Ask</th><th>Model</th><th>Edge</th><th>Kelly $</th>
+          <th>Score / Book</th><th>Action</th>
+        </tr></thead>
+        <tbody id="sig-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- POSITIONS -->
+  <div class="panel" id="panel-positions">
+    <div class="stats">
+      <div class="card"><div class="lbl">Open Positions</div><div class="val" id="p-count">-</div></div>
+      <div class="card"><div class="lbl">Total At Risk</div><div class="val yellow" id="p-risk">-</div></div>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Player / Team</th><th>Ticker</th><th>Contracts</th>
+          <th>Price</th><th>Cost</th><th>Source</th><th>Opened</th>
+        </tr></thead>
+        <tbody id="pos-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ORDERS -->
+  <div class="panel" id="panel-orders">
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Player</th><th>Side</th><th>Qty</th>
+          <th>Price</th><th>Cost</th><th>Edge</th><th>Status</th><th>Src</th>
+        </tr></thead>
+        <tbody id="ord-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- LOG -->
+  <div class="panel" id="panel-log">
+    <div class="log-box" id="log-box"><div class="dim">Waiting for scanner...</div></div>
+  </div>
+
+  <!-- SETTINGS -->
+  <div class="panel" id="panel-settings">
+
+    <div class="setting-group">
+      <h3>Scanner Control</h3>
+      <div class="controls">
+        <button class="btn btn-green" id="btn-start"     onclick="startScanner(false)">Start (Dry Run)</button>
+        <button class="btn btn-orange" id="btn-start-live" onclick="startScanner(true)">Start LIVE</button>
+        <button class="btn btn-red"   id="btn-stop"      onclick="stopScanner()">Stop</button>
+      </div>
+      <p style="font-size:11px;color:#555">LIVE mode places real orders. Confirm twice before enabling.</p>
+    </div>
+
+    <div class="setting-group">
+      <h3>Thresholds</h3>
+      <div class="cfg-row">
+        <label>Min Edge</label>
+        <input type="range" id="rng-min-edge" min="1" max="20" step="1"
+               oninput="showVal('min-edge', (this.value/100).toFixed(2)*100 + '%')">
+        <span class="cfg-val" id="val-min-edge">4%</span>
+      </div>
+      <div class="cfg-row">
+        <label>Max Bet (USD)</label>
+        <input type="range" id="rng-max-bet" min="5" max="200" step="5"
+               oninput="showVal('max-bet', '$'+this.value)">
+        <span class="cfg-val" id="val-max-bet">$25</span>
+      </div>
+      <div class="cfg-row">
+        <label>Kelly Fraction</label>
+        <input type="range" id="rng-kelly" min="10" max="100" step="5"
+               oninput="showVal('kelly', (this.value/100).toFixed(2))">
+        <span class="cfg-val" id="val-kelly">0.50</span>
+      </div>
+      <div class="cfg-row">
+        <label>Live Scan Interval</label>
+        <input type="range" id="rng-live-int" min="10" max="120" step="10"
+               oninput="showVal('live-int', this.value+'s')">
+        <span class="cfg-val" id="val-live-int">30s</span>
+      </div>
+      <button class="btn btn-gray" onclick="saveConfig()" style="margin-top:6px">Save Config</button>
+    </div>
+
+  </div>
+
+</div><!-- /content -->
+
+<script>
+// ── Tab switching ──────────────────────────────────────────────────────────
+let currentTab = 'signals';
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) =>
+    t.classList.toggle('active', ['signals','positions','orders','log','settings'][i] === name)
+  );
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  currentTab = name;
+  if (name === 'positions') loadPositions();
+  if (name === 'orders')    loadOrders();
+  if (name === 'log')       loadLog();
+}
+
+// ── Formatting helpers ─────────────────────────────────────────────────────
+function pct(v, decimals=1) {
+  if (v == null) return '-';
+  return (v >= 0 ? '+' : '') + (v * 100).toFixed(decimals) + '%';
+}
+function pctPlain(v, decimals=1) {
+  if (v == null) return '-';
+  return (v * 100).toFixed(decimals) + '%';
+}
+function fmtTime(iso) {
+  if (!iso) return '-';
+  return new Date(iso).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+function edgeCls(e) { return e > 0 ? 'green' : (e < 0 ? 'red' : 'dim'); }
+
+// ── Status ─────────────────────────────────────────────────────────────────
+let _config = {};
+async function loadStatus() {
+  try {
+    const s = await fetch('/api/status').then(r => r.json());
+    const dot = document.getElementById('dot');
+    dot.className = 'dot ' + (s.running ? 'on' : 'off');
+    const badge = document.getElementById('badge');
+    badge.textContent = s.dry_run ? 'DRY RUN' : 'LIVE';
+    badge.className   = 'badge ' + (s.dry_run ? 'dry' : 'live');
+    const ls = document.getElementById('lastScan');
+    ls.textContent = s.last_live_scan ? 'last scan ' + fmtTime(s.last_live_scan) : '';
+    _config = s.config;
+    syncSliders(s.config);
+  } catch(_) {}
+}
+
+function syncSliders(cfg) {
+  setValue('min-edge', Math.round(cfg.min_edge * 100),
+           Math.round(cfg.min_edge * 100) + '%');
+  setValue('max-bet',  cfg.max_bet_usd, '$' + cfg.max_bet_usd);
+  setValue('kelly',    Math.round(cfg.kelly_fraction * 100),
+           cfg.kelly_fraction.toFixed(2));
+  setValue('live-int', cfg.live_interval_sec, cfg.live_interval_sec + 's');
+}
+
+function setValue(id, rngVal, display) {
+  const r = document.getElementById('rng-' + id);
+  if (r) r.value = rngVal;
+  const v = document.getElementById('val-' + id);
+  if (v) v.textContent = display;
+}
+
+function showVal(id, text) {
+  document.getElementById('val-' + id).textContent = text;
+}
+
+// ── Signals ────────────────────────────────────────────────────────────────
+async function loadSignals() {
+  try {
+    const sigs = await fetch('/api/signals').then(r => r.json());
+    const buys = sigs.filter(s => s.edge > 0);
+    const live = sigs.filter(s => s.source === 'live');
+    const arb  = sigs.filter(s => s.source === 'arb');
+    const best = sigs.length ? Math.max(...sigs.map(s => s.edge)) : null;
+    document.getElementById('s-total').textContent = sigs.length || '-';
+    document.getElementById('s-buys').textContent  = buys.length || '-';
+    document.getElementById('s-edge').textContent  = best != null ? pct(best) : '-';
+    document.getElementById('s-live').textContent  = live.length || '-';
+    document.getElementById('s-arb').textContent   = arb.length  || '-';
+
+    const tbody = document.getElementById('sig-body');
+    if (!sigs.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No signals yet — start the scanner in Settings</td></tr>';
+      return;
+    }
+    tbody.innerHTML = sigs.map(s => `
+      <tr>
+        <td>${s.player || ''}</td>
+        <td class="dim">${s.sport || ''}</td>
+        <td><span class="src ${s.source}">${s.source.toUpperCase()}</span></td>
+        <td>${pctPlain(s.kalshi_ask)}</td>
+        <td>${pctPlain(s.model_prob)}</td>
+        <td class="${edgeCls(s.edge)}">${pct(s.edge)}</td>
+        <td>$${(s.kelly_usd || 0).toFixed(2)}</td>
+        <td class="dim" style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">${s.score_state || ''}</td>
+        <td class="${s.direction === 'BUY' ? 'buy' : 'skip'}">${s.direction}</td>
+      </tr>`).join('');
+  } catch(_) {}
+}
+
+// ── Positions ──────────────────────────────────────────────────────────────
+async function loadPositions() {
+  try {
+    const ps = await fetch('/api/positions').then(r => r.json());
+    const total = ps.reduce((s, p) => s + p.cost_usd, 0);
+    document.getElementById('p-count').textContent = ps.length || '0';
+    document.getElementById('p-risk').textContent  = '$' + total.toFixed(2);
+
+    const tbody = document.getElementById('pos-body');
+    if (!ps.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No open positions</td></tr>';
+      return;
+    }
+    tbody.innerHTML = ps.map(p => `
+      <tr>
+        <td>${p.player}</td>
+        <td class="dim" style="font-size:11px">${p.ticker}</td>
+        <td>${p.contracts}</td>
+        <td>${p.price_cents}c</td>
+        <td class="yellow">$${p.cost_usd.toFixed(2)}</td>
+        <td><span class="src ${p.source}">${p.source}</span></td>
+        <td class="dim" style="font-size:11px">${fmtTime(p.opened_at)}</td>
+      </tr>`).join('');
+  } catch(_) {}
+}
+
+// ── Orders ─────────────────────────────────────────────────────────────────
+async function loadOrders() {
+  try {
+    const os = await fetch('/api/orders').then(r => r.json());
+    const tbody = document.getElementById('ord-body');
+    if (!os.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No orders logged yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = os.map(o => `
+      <tr>
+        <td class="dim" style="font-size:11px">${fmtTime(o.ts)}</td>
+        <td>${o.player}</td>
+        <td>${(o.side||'').toUpperCase()}</td>
+        <td>${o.contracts}</td>
+        <td>${o.price_cents}c</td>
+        <td>$${(o.cost_usd||0).toFixed(2)}</td>
+        <td class="${edgeCls(o.edge)}">${pct(o.edge)}</td>
+        <td><span class="st ${o.status}">${o.status}</span></td>
+        <td><span class="src ${o.source}">${o.source}</span></td>
+      </tr>`).join('');
+  } catch(_) {}
+}
+
+// ── Log ────────────────────────────────────────────────────────────────────
+async function loadLog() {
+  try {
+    const lines = await fetch('/api/log').then(r => r.json());
+    const box = document.getElementById('log-box');
+    const atBottom = box.scrollHeight - box.clientHeight <= box.scrollTop + 10;
+    box.innerHTML = lines.map(l => `<div>${l}</div>`).join('') || '<div class="dim">No log entries yet.</div>';
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  } catch(_) {}
+}
+
+// ── Scanner controls ───────────────────────────────────────────────────────
+async function startScanner(live) {
+  if (live) {
+    if (!confirm('Enable LIVE trading?\\n\\nReal orders will be placed with real money.')) return;
+    if (!confirm('Are you sure? This is your second confirmation.')) return;
+  }
+  await fetch('/api/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dry_run: !live})
+  });
+  loadStatus();
+}
+
+async function stopScanner() {
+  await fetch('/api/stop', {method: 'POST'});
+  loadStatus();
+}
+
+// ── Config save ────────────────────────────────────────────────────────────
+async function saveConfig() {
+  const payload = {
+    min_edge:          parseFloat(document.getElementById('rng-min-edge').value) / 100,
+    max_bet_usd:       parseFloat(document.getElementById('rng-max-bet').value),
+    kelly_fraction:    parseFloat(document.getElementById('rng-kelly').value) / 100,
+    live_interval_sec: parseFloat(document.getElementById('rng-live-int').value),
+  };
+  await fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  loadStatus();
+}
+
+// ── Polling loop ───────────────────────────────────────────────────────────
+async function poll() {
+  await loadStatus();
+  await loadSignals();
+  if (currentTab === 'positions') await loadPositions();
+  if (currentTab === 'orders')    await loadOrders();
+  if (currentTab === 'log')       await loadLog();
+}
+
+poll();
+setInterval(poll, 15000);
+</script>
+</body>
+</html>"""
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--host", default="0.0.0.0")
+    args = parser.parse_args()
+    print(f"Dashboard running at http://{args.host}:{args.port}")
+    print("Open http://localhost:{} in your browser".format(args.port))
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)

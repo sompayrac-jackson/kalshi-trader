@@ -1,0 +1,13 @@
+# Secrets — never commit these
+private_key.pem
+*.pem
+.env
+
+# Runtime data — trading logs, position state
+*.jsonl
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
