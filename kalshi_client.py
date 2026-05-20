@@ -68,7 +68,7 @@ class KalshiClient:
         return self._get("/markets", params=params)
 
     def get_market(self, ticker: str) -> dict:
-        return self._get(f"/markets/{ticker}")
+        return self._get(f"/markets/{ticker}").get("market", {})
 
     def get_orderbook(self, ticker: str, depth: int = 10) -> dict:
         return self._get(f"/markets/{ticker}/orderbook", params={"depth": depth})

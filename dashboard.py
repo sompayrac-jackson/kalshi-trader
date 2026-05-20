@@ -36,6 +36,7 @@ KALSHI_API_KEY = config.KALSHI_API_KEY
 ODDS_API_KEY   = config.ODDS_API_KEY
 POSITIONS_FILE = Path("positions.jsonl")
 ORDERS_FILE    = Path("orders.jsonl")
+PERF_CACHE_FILE = Path("perf_cache.json")
 
 app = Flask(__name__)
 
@@ -251,7 +252,7 @@ _CONFIG_BOUNDS = {
     "min_edge":          (0.01, 0.50),
     "max_bet_usd":       (1.0,  500.0),
     "kelly_fraction":    (0.05, 1.0),
-    "arb_interval_sec":  (60,   3600),
+    "arb_interval_sec":  (300,  86400),
     "live_interval_sec": (10,   300),
 }
 
@@ -501,6 +502,114 @@ def api_upcoming():
     return jsonify(data)
 
 
+# ── Performance tracker ───────────────────────────────────────────────────────
+
+def _load_perf_cache() -> dict:
+    if not PERF_CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(PERF_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_perf_cache(cache: dict):
+    PERF_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+
+@app.route("/api/performance")
+@_require_auth
+def api_performance():
+    # Load all logged orders
+    all_orders: list[dict] = []
+    if ORDERS_FILE.exists():
+        for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                all_orders.append(json.loads(line))
+            except Exception:
+                pass
+
+    # Include: confirmed dry_run orders + liquidity-skipped orders (model said buy)
+    virtual = [
+        o for o in all_orders
+        if o.get("dry_run") and o.get("contracts", 0) > 0
+        and o.get("status") in ("dry_run", "skipped")
+        and ("liquidity" in o.get("error", "") or o.get("status") == "dry_run")
+    ]
+
+    # Load and refresh resolution cache
+    perf_cache = _load_perf_cache()
+    unresolved_tickers = {
+        o["ticker"] for o in virtual
+        if o["ticker"] not in perf_cache
+    }
+
+    if unresolved_tickers:
+        client = _get_client()
+        for ticker in unresolved_tickers:
+            try:
+                m      = client.get_market(ticker)
+                result = m.get("result", "")
+                if result:
+                    perf_cache[ticker] = result
+            except Exception:
+                pass
+        _save_perf_cache(perf_cache)
+
+    # Build resolved / pending lists
+    resolved_orders: list[dict] = []
+    pending_orders:  list[dict] = []
+
+    for o in virtual:
+        result = perf_cache.get(o["ticker"])
+        if result:
+            side = o.get("side", "yes")
+            won  = (side == "yes" and result == "yes") or \
+                   (side == "no"  and result == "no")
+            # cost_usd already accounts for side (see order_executor.py)
+            cost = o.get("cost_usd", 0)
+            pnl  = (o["contracts"] - cost) if won else -cost
+            resolved_orders.append({**o, "result": result, "won": won, "pnl": round(pnl, 2)})
+        else:
+            pending_orders.append(o)
+
+    # Summary stats
+    total_cost = sum(o.get("cost_usd", 0) for o in resolved_orders)
+    total_pnl  = sum(o["pnl"] for o in resolved_orders)
+    wins       = sum(1 for o in resolved_orders if o["won"])
+    n          = len(resolved_orders)
+
+    # Edge bucket analysis — did higher edge bets actually win more?
+    buckets: dict[str, dict] = {}
+    for o in resolved_orders:
+        edge = o.get("edge", 0)
+        if edge < 0.05:   label = "3-5%"
+        elif edge < 0.10: label = "5-10%"
+        elif edge < 0.20: label = "10-20%"
+        else:             label = "20%+"
+        b = buckets.setdefault(label, {"bets": 0, "wins": 0, "pnl": 0.0})
+        b["bets"] += 1
+        b["wins"] += int(o["won"])
+        b["pnl"]  += o["pnl"]
+
+    return jsonify({
+        "summary": {
+            "total_virtual_bets": len(virtual),
+            "resolved":           n,
+            "pending":            len(pending_orders),
+            "wins":               wins,
+            "losses":             n - wins,
+            "win_rate":           round(wins / n, 3) if n else 0,
+            "total_invested":     round(total_cost, 2),
+            "total_pnl":          round(total_pnl, 2),
+            "roi":                round(total_pnl / total_cost, 3) if total_cost else 0,
+        },
+        "edge_buckets": buckets,
+        "resolved":  sorted(resolved_orders, key=lambda x: x["ts"], reverse=True)[:100],
+        "pending":   sorted(pending_orders,  key=lambda x: x["ts"], reverse=True)[:50],
+    })
+
+
 @app.route("/")
 @_require_auth
 def index():
@@ -663,6 +772,7 @@ HTML = """<!DOCTYPE html>
   <div class="tab" onclick="showTab('upcoming')">Games</div>
   <div class="tab" onclick="showTab('positions')">Positions</div>
   <div class="tab" onclick="showTab('orders')">Orders</div>
+  <div class="tab" onclick="showTab('performance')">Performance</div>
   <div class="tab" onclick="showTab('log')">Log</div>
   <div class="tab" onclick="showTab('settings')">Settings</div>
 </div>
@@ -746,6 +856,33 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- PERFORMANCE -->
+  <div class="panel" id="panel-performance">
+    <div class="stats" id="perf-stats">
+      <div class="card"><div class="lbl">Virtual Bets</div><div class="val" id="pf-total">-</div></div>
+      <div class="card"><div class="lbl">Resolved</div><div class="val" id="pf-resolved">-</div></div>
+      <div class="card"><div class="lbl">Win Rate</div><div class="val" id="pf-winrate">-</div></div>
+      <div class="card"><div class="lbl">Hypothetical P&amp;L</div><div class="val" id="pf-pnl">-</div></div>
+      <div class="card"><div class="lbl">ROI</div><div class="val" id="pf-roi">-</div></div>
+    </div>
+
+    <div style="margin:20px 0 8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.08em">Edge Bucket Analysis</div>
+    <div id="perf-buckets" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px"></div>
+
+    <div style="margin-bottom:8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.08em">
+      Resolved Bets <span style="color:#555" id="pf-pending-note"></span>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Player</th><th>Side</th><th>Qty</th>
+          <th>Cost</th><th>Edge</th><th>Result</th><th>P&amp;L</th><th>Src</th>
+        </tr></thead>
+        <tbody id="perf-body"></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- LOG -->
   <div class="panel" id="panel-log">
     <div class="log-box" id="log-box"><div class="dim">Waiting for scanner...</div></div>
@@ -790,6 +927,15 @@ HTML = """<!DOCTYPE html>
                oninput="showVal('live-int', this.value+'s')">
         <span class="cfg-val" id="val-live-int">30s</span>
       </div>
+      <div class="cfg-row">
+        <label>Arb Scan Interval</label>
+        <input type="range" id="rng-arb-int" min="1" max="24" step="1"
+               oninput="showVal('arb-int', this.value+'h')">
+        <span class="cfg-val" id="val-arb-int">6h</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:12px">
+        Free Odds API tier: 500 req/mo. At 8 req/scan: 1h=5,760/mo, 6h=960/mo, 24h=240/mo.
+      </p>
       <button class="btn btn-gray" onclick="saveConfig()" style="margin-top:6px">Save Config</button>
     </div>
 
@@ -802,15 +948,16 @@ HTML = """<!DOCTYPE html>
 let currentTab = 'signals';
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t, i) =>
-    t.classList.toggle('active', ['signals','upcoming','positions','orders','log','settings'][i] === name)
+    t.classList.toggle('active', ['signals','upcoming','positions','orders','performance','log','settings'][i] === name)
   );
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.getElementById('panel-' + name).classList.add('active');
   currentTab = name;
-  if (name === 'upcoming')  { loadLiveNow(); loadUpcoming(); }
-  if (name === 'positions') loadPositions();
-  if (name === 'orders')    loadOrders();
-  if (name === 'log')       loadLog();
+  if (name === 'upcoming')     { loadLiveNow(); loadUpcoming(); }
+  if (name === 'positions')    loadPositions();
+  if (name === 'orders')       loadOrders();
+  if (name === 'performance')  loadPerformance();
+  if (name === 'log')          loadLog();
 }
 
 // ── Formatting helpers ─────────────────────────────────────────────────────
@@ -852,6 +999,8 @@ function syncSliders(cfg) {
   setValue('kelly',    Math.round(cfg.kelly_fraction * 100),
            cfg.kelly_fraction.toFixed(2));
   setValue('live-int', cfg.live_interval_sec, cfg.live_interval_sec + 's');
+  const arbH = Math.max(1, Math.round(cfg.arb_interval_sec / 3600));
+  setValue('arb-int', arbH, arbH + 'h');
 }
 
 function setValue(id, rngVal, display) {
@@ -986,12 +1135,15 @@ async function saveConfig() {
     max_bet_usd:       parseFloat(document.getElementById('rng-max-bet').value),
     kelly_fraction:    parseFloat(document.getElementById('rng-kelly').value) / 100,
     live_interval_sec: parseFloat(document.getElementById('rng-live-int').value),
+    arb_interval_sec:  parseFloat(document.getElementById('rng-arb-int').value) * 3600,
   };
-  await fetch('/api/config', {
+  const r = await fetch('/api/config', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(payload)
   });
+  const data = await r.json();
+  if (!data.ok) { alert('Error: ' + (data.errors || []).join(', ')); return; }
   loadStatus();
 }
 
@@ -1137,14 +1289,79 @@ async function loadUpcoming() {
   }
 }
 
+// ── Performance ────────────────────────────────────────────────────────────
+async function loadPerformance() {
+  const container = document.getElementById('perf-stats');
+  try {
+    const d = await fetch('/api/performance').then(r => r.json());
+    const s = d.summary;
+    const pnlPos = s.total_pnl >= 0;
+
+    document.getElementById('pf-total').textContent    = s.total_virtual_bets;
+    document.getElementById('pf-resolved').textContent = s.resolved;
+    document.getElementById('pf-winrate').textContent  = s.resolved ? Math.round(s.win_rate * 100) + '%' : '-';
+    const pnlEl = document.getElementById('pf-pnl');
+    pnlEl.textContent  = (pnlPos ? '+' : '') + '$' + s.total_pnl.toFixed(2);
+    pnlEl.className    = 'val ' + (pnlPos ? 'green' : 'red');
+    const roiEl = document.getElementById('pf-roi');
+    roiEl.textContent  = s.resolved ? (pnlPos ? '+' : '') + Math.round(s.roi * 100) + '%' : '-';
+    roiEl.className    = 'val ' + (pnlPos ? 'green' : 'red');
+
+    const pn = document.getElementById('pf-pending-note');
+    if (pn) pn.textContent = s.pending ? `(${s.pending} pending resolution)` : '';
+
+    // Edge buckets
+    const bucketOrder = ['3-5%','5-10%','10-20%','20%+'];
+    const bkEl = document.getElementById('perf-buckets');
+    bkEl.innerHTML = bucketOrder.map(label => {
+      const b = d.edge_buckets[label];
+      if (!b) return '';
+      const wr = b.bets ? Math.round(b.wins / b.bets * 100) : 0;
+      const pnlPos2 = b.pnl >= 0;
+      return `<div class="card" style="min-width:120px">
+        <div class="lbl">Edge ${label}</div>
+        <div style="font-size:18px;color:#fff;margin-top:6px;font-weight:bold">${wr}%</div>
+        <div style="font-size:11px;color:#555;margin-top:2px">${b.bets} bets</div>
+        <div style="font-size:11px;margin-top:2px;color:${pnlPos2?'#00ff88':'#ff6b6b'}">${pnlPos2?'+':''}$${b.pnl.toFixed(2)}</div>
+      </div>`;
+    }).join('');
+
+    // Resolved table
+    const tbody = document.getElementById('perf-body');
+    if (!d.resolved.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No resolved bets yet — markets settle after each match.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.resolved.map(o => {
+      const won = o.won;
+      const pnlPos2 = o.pnl >= 0;
+      return `<tr>
+        <td class="dim" style="font-size:11px">${fmtTime(o.ts)}</td>
+        <td>${o.player}</td>
+        <td>${(o.side||'').toUpperCase()}</td>
+        <td>${o.contracts}</td>
+        <td>$${(o.cost_usd||0).toFixed(2)}</td>
+        <td class="${o.edge>0?'green':'red'}">${pct(o.edge)}</td>
+        <td style="color:${won?'#00ff88':'#ff6b6b'}">${o.result.toUpperCase()} ${won?'WIN':'LOSS'}</td>
+        <td style="color:${pnlPos2?'#00ff88':'#ff6b6b'};font-weight:bold">${pnlPos2?'+':''}$${o.pnl.toFixed(2)}</td>
+        <td><span class="src ${o.source}">${o.source}</span></td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('perf-body').innerHTML =
+      '<tr><td colspan="9" class="empty">Failed to load performance data.</td></tr>';
+  }
+}
+
 // ── Polling loop ───────────────────────────────────────────────────────────
 async function poll() {
   await loadStatus();
   await loadSignals();
-  if (currentTab === 'upcoming')  { await loadLiveNow(); await loadUpcoming(); }
-  if (currentTab === 'positions') await loadPositions();
-  if (currentTab === 'orders')    await loadOrders();
-  if (currentTab === 'log')       await loadLog();
+  if (currentTab === 'upcoming')     { await loadLiveNow(); await loadUpcoming(); }
+  if (currentTab === 'positions')    await loadPositions();
+  if (currentTab === 'orders')       await loadOrders();
+  if (currentTab === 'performance')  await loadPerformance();
+  if (currentTab === 'log')          await loadLog();
 }
 
 poll();
