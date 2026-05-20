@@ -51,3 +51,8 @@ PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
 # Leave DASHBOARD_PASS empty to disable auth (local dev only)
 DASHBOARD_USER   = os.getenv("DASHBOARD_USER", "kalshi")
 DASHBOARD_PASS   = os.getenv("DASHBOARD_PASS", "")
+
+# Pushover push notifications (live trades only — dry-run is never notified)
+# Get these from https://pushover.net after installing the app
+PUSHOVER_USER_KEY  = os.getenv("PUSHOVER_USER_KEY", "")
+PUSHOVER_APP_TOKEN = os.getenv("PUSHOVER_APP_TOKEN", "")

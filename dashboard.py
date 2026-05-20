@@ -22,6 +22,7 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request, Response
 
 import config
+import notifier
 from kalshi_client import KalshiClient
 import live_scanner as live_mod
 from live_scanner import scan_live
@@ -420,6 +421,25 @@ _ALL_LOG_FILES = (
     EXITS_DRY_FILE,  EXITS_LIVE_FILE,
     PERF_CACHE_DRY,  PERF_CACHE_LIVE,
 )
+
+
+@app.route("/api/notifications/test", methods=["POST"])
+@_require_auth
+def api_notify_test():
+    ok = notifier.send(
+        "Kalshi Trader — Test",
+        "Notifications are working. You'll receive alerts for all live trade events.",
+    )
+    return jsonify({"ok": ok, "enabled": notifier.ENABLED,
+                    "configured": bool(config.PUSHOVER_USER_KEY and config.PUSHOVER_APP_TOKEN)})
+
+
+@app.route("/api/notifications/toggle", methods=["POST"])
+@_require_auth
+def api_notify_toggle():
+    data = request.get_json(silent=True) or {}
+    notifier.ENABLED = bool(data.get("enabled", True))
+    return jsonify({"ok": True, "enabled": notifier.ENABLED})
 
 
 @app.route("/api/sell", methods=["POST"])
@@ -1256,6 +1276,22 @@ HTML = """<!DOCTYPE html>
     </div>
 
     <div class="setting-group">
+      <h3>Notifications</h3>
+      <p style="font-size:11px;color:#555;margin-bottom:10px">
+        Push notifications via Pushover — <strong>live trades only</strong>, never dry-run.
+        Requires <code>PUSHOVER_USER_KEY</code> and <code>PUSHOVER_APP_TOKEN</code> in <code>.env</code>.
+      </p>
+      <div class="controls" style="align-items:center;gap:16px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="chk-notify" onchange="toggleNotify(this.checked)" style="width:16px;height:16px">
+          Enable notifications
+        </label>
+        <button class="btn btn-gray" onclick="testNotify()">Send Test</button>
+      </div>
+      <p id="notify-msg" style="font-size:11px;color:#4caf50;margin-top:8px"></p>
+    </div>
+
+    <div class="setting-group">
       <h3>Performance Logs</h3>
       <p style="font-size:11px;color:#555;margin-bottom:12px">
         Affects <code>orders.jsonl</code>, <code>exits.jsonl</code>, and <code>perf_cache.json</code>.
@@ -1314,6 +1350,7 @@ function showTab(name) {
   if (name === 'orders')       loadOrders();
   if (name === 'performance')  loadPerformance();
   if (name === 'log')          loadLog();
+  if (name === 'settings')     loadNotifyState();
 }
 
 // ── Formatting helpers ─────────────────────────────────────────────────────
@@ -1547,6 +1584,41 @@ async function startScanner(live) {
 async function stopScanner() {
   await fetch('/api/stop', {method: 'POST'});
   loadStatus();
+}
+
+// ── Notifications ─────────────────────────────────────────────────────────
+async function loadNotifyState() {
+  try {
+    const r = await fetch('/api/notifications/test', {method:'POST'});
+    const d = await r.json();
+    const box = document.getElementById('chk-notify');
+    if (box) box.checked = d.enabled;
+    const msg = document.getElementById('notify-msg');
+    if (msg && !d.configured) msg.textContent = 'Keys not configured — add PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN to .env';
+  } catch(_) {}
+}
+
+async function toggleNotify(enabled) {
+  await fetch('/api/notifications/toggle', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enabled})
+  });
+}
+
+async function testNotify() {
+  const r  = await fetch('/api/notifications/test', {method:'POST'});
+  const d  = await r.json();
+  const msg = document.getElementById('notify-msg');
+  if (!d.configured) {
+    msg.style.color = '#ff6b6b';
+    msg.textContent = 'Keys not set — add PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN to .env on the server.';
+  } else if (d.ok) {
+    msg.style.color = '#4caf50';
+    msg.textContent = 'Test notification sent!';
+  } else {
+    msg.style.color = '#ff6b6b';
+    msg.textContent = 'Send failed — check keys in .env.';
+  }
 }
 
 // ── Log management ────────────────────────────────────────────────────────

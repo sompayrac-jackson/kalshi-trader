@@ -17,6 +17,7 @@ from pathlib import Path
 from kalshi_client import KalshiClient
 from arb_scanner import ArbSignal
 from live_scanner import LiveSignal
+import notifier
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -219,6 +220,8 @@ def execute(
         result.status   = resp.get("order", {}).get("status", "submitted")
         if result.status in ("submitted", "resting"):
             _open_tickers.add(ticker)
+            notifier.notify_buy(ticker, player, side, contracts,
+                                price_cents, cost_usd, edge)
         _print(result)
         _log(result)
     except Exception as e:
@@ -314,6 +317,8 @@ def execute_exit(
         result.order_id = resp.get("order", {}).get("order_id", "")
         result.status   = resp.get("order", {}).get("status", "submitted")
         _open_tickers.discard(ticker)
+        notifier.notify_sell(ticker, side, contracts,
+                             entry_cents, bid_cents, pnl_usd, reason)
         _log_exit(result)
     except Exception as e:
         result.status = "error"
