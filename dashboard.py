@@ -165,6 +165,18 @@ def _scale_exits(cost_usd: float, base_sl: float, base_pt: float, cfg: dict) -> 
     return base_sl * scale, base_pt * scale
 
 
+def _model_pt_scale(model_prob: float) -> float:
+    """
+    Scale PT threshold up based on model confidence so high-confidence positions
+    hold toward settlement instead of exiting early.
+    At 50% confidence → 1× (unchanged).
+    At 70% → ~2.6×, at 85% → ~4.2×, at 95%+ → ~5× (effectively hold to settlement).
+    SL is not affected — model confidence doesn't help a losing position.
+    """
+    confidence = max(0.0, model_prob - 0.5) * 2   # 0 at ≤50%, 1 at 100%
+    return 1.0 + confidence * 4.0
+
+
 def _check_exits(client: KalshiClient):
     """
     Scan open positions (real in live mode, virtual from orders.jsonl in dry-run)
@@ -225,9 +237,13 @@ def _check_exits(client: KalshiClient):
                         "entry_cents": o.get("price_cents", 0),
                         "contracts":   o.get("contracts", 0),
                         "side":        o.get("side", "yes"),
+                        "edge":        o.get("edge", 0.0),
                     }
             except Exception:
                 pass
+
+    # Current signal lookup for model-prob-based PT scaling
+    sig_lookup = {s["ticker"]: s for s in _state.get("signals", [])}
 
     # Combine: real first, then virtual for tickers not already in real positions
     real_tickers = {p.get("ticker") for p in real_positions}
@@ -261,6 +277,17 @@ def _check_exits(client: KalshiClient):
             cost_usd = float(pos.get("market_exposure_dollars", 0)) or entry_cents / 100 * net_pos
         sl_pct, pt_pct = _scale_exits(cost_usd, stop_loss_pct, profit_take_pct, cfg)
 
+        # Model-probability-based PT scaling: use current signal if available,
+        # fall back to entry model_prob reconstructed from stored edge + ask
+        cur_sig = sig_lookup.get(ticker)
+        if cur_sig:
+            model_prob = float(cur_sig.get("model_prob", 0.5))
+        else:
+            em = entry_map.get(ticker, {})
+            model_prob = em.get("edge", 0.0) + (entry_cents / 100)
+            model_prob = max(0.5, min(0.99, model_prob))
+        pt_pct = pt_pct * _model_pt_scale(model_prob)
+
         try:
             market      = client.get_market(ticker)
             bid_dollars = float(market.get("yes_bid_dollars") or 0)
@@ -282,7 +309,7 @@ def _check_exits(client: KalshiClient):
             r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "stop_loss")
             _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
         elif rise >= pt_pct:
-            _log(f"[EXIT] {tag}PROFIT-TAKE {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ rise={rise:.1%} pt={pt_pct:.0%} (cost=${cost_usd:.2f})")
+            _log(f"[EXIT] {tag}PROFIT-TAKE {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ rise={rise:.1%} pt={pt_pct:.0%} model={model_prob:.0%} (cost=${cost_usd:.2f})")
             r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "profit_take")
             _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
 
