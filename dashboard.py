@@ -387,8 +387,10 @@ def api_signals():
 @_require_auth
 def api_positions():
     try:
-        c = _client or KalshiClient(api_key_id=KALSHI_API_KEY)
-        raw = c.get_positions().get("market_positions", [])
+        c    = _client or KalshiClient(api_key_id=KALSHI_API_KEY)
+        resp = c.get_positions()
+        raw_markets = resp.get("market_positions", [])
+        raw_events  = resp.get("event_positions", [])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -409,24 +411,60 @@ def api_positions():
             except Exception:
                 pass
 
+    with _price_lock:
+        prices = dict(_price_cache)
+
+    cfg     = _state["config"]
+    sl_base = cfg.get("stop_loss_pct", 0.35)
+    pt_base = cfg.get("profit_take_pct", 0.50)
+
     positions = []
-    for p in raw:
+    for p in raw_markets:
         ticker    = p.get("ticker", "")
         contracts = int(float(p.get("position_fp", 0)))
         cost_usd  = float(p.get("market_exposure_dollars", 0))
+        fees_usd  = float(p.get("fees_paid_dollars", 0))
+        realized  = float(p.get("realized_pnl_dollars", 0))
         if contracts <= 0:
             continue
-        meta = order_meta.get(ticker, {})
+        meta        = order_meta.get(ticker, {})
+        entry_cents = meta.get("price_cents", 0)
+
+        bid = prices.get(ticker)
+        current_bid_cents = round(bid * 100) if bid else None
+        unrealized_pnl = (
+            (current_bid_cents - entry_cents) * contracts / 100
+            if current_bid_cents and entry_cents else None
+        )
+
+        sl_pct, pt_pct = _scale_exits(cost_usd, sl_base, pt_base, cfg)
         positions.append({
-            "ticker":      ticker,
-            "player":      meta.get("player", ticker),
-            "contracts":   contracts,
-            "price_cents": meta.get("price_cents", 0),
-            "cost_usd":    cost_usd,
-            "source":      meta.get("source", "live"),
-            "opened_at":   meta.get("opened_at", ""),
+            "ticker":            ticker,
+            "player":            meta.get("player", ticker),
+            "contracts":         contracts,
+            "price_cents":       entry_cents,
+            "current_bid_cents": current_bid_cents,
+            "cost_usd":          cost_usd,
+            "fees_usd":          fees_usd,
+            "realized_pnl":      realized,
+            "unrealized_pnl":    unrealized_pnl,
+            "stop_loss_cents":   round(entry_cents * (1 - sl_pct)) if entry_cents else None,
+            "profit_take_cents": min(99, round(entry_cents * (1 + pt_pct))) if entry_cents else None,
+            "source":            meta.get("source", "live"),
+            "opened_at":         meta.get("opened_at", ""),
         })
-    return jsonify(positions)
+
+    events = [
+        {
+            "event_ticker": e.get("event_ticker", ""),
+            "cost_usd":     float(e.get("total_cost_dollars", 0)),
+            "fees_usd":     float(e.get("fees_paid_dollars", 0)),
+            "contracts":    int(float(e.get("total_cost_shares_fp", 0))),
+        }
+        for e in raw_events
+    ]
+
+    return jsonify({"positions": positions, "events": events})
 
 
 @app.route("/api/orders")
@@ -1180,7 +1218,7 @@ HTML = """<!DOCTYPE html>
 <div class="tabs">
   <div class="tab active" onclick="showTab('signals')">Signals</div>
   <div class="tab" onclick="showTab('upcoming')">Games</div>
-  <div class="tab" onclick="showTab('positions')">Positions</div>
+  <div class="tab" onclick="showTab('positions')">Portfolio</div>
   <div class="tab" onclick="showTab('orders')">Orders</div>
   <div class="tab" onclick="showTab('performance')">Performance</div>
   <div class="tab" onclick="showTab('log')">Log</div>
@@ -1236,17 +1274,29 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- POSITIONS -->
+  <!-- PORTFOLIO -->
   <div class="panel" id="panel-positions">
     <div class="stats">
       <div class="card"><div class="lbl">Open Positions</div><div class="val" id="p-count">-</div></div>
-      <div class="card"><div class="lbl">Total At Risk</div><div class="val yellow" id="p-risk">-</div></div>
+      <div class="card"><div class="lbl">Total Invested</div><div class="val yellow" id="p-invested">-</div></div>
+      <div class="card"><div class="lbl">Total Contracts</div><div class="val" id="p-contracts">-</div></div>
+      <div class="card"><div class="lbl">Fees Paid</div><div class="val red" id="p-fees">-</div></div>
+      <div class="card"><div class="lbl">Unrealized P&amp;L</div><div class="val" id="p-unrealized">-</div></div>
     </div>
+
+    <div style="margin:18px 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.08em">Exposure by Event</div>
+    <div id="p-event-bars" style="margin-bottom:24px"></div>
+
+    <div style="margin:18px 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.08em">Open Positions</div>
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Player / Team</th><th>Ticker</th><th>Contracts</th>
-          <th>Price</th><th>Cost</th><th>Source</th><th>Opened</th>
+          <th>Player</th><th>Contracts</th><th>Entry</th>
+          <th title="Latest yes_bid from scanner">Current</th>
+          <th title="Unrealized P&L based on current bid">Unreal P&L</th>
+          <th>Invested</th><th>Fees</th>
+          <th title="Stop-loss / Profit-take trigger prices (cost-scaled)">SL / PT</th>
+          <th>Opened</th>
         </tr></thead>
         <tbody id="pos-body"></tbody>
       </table>
@@ -1549,30 +1599,100 @@ async function loadSignals() {
   } catch(_) {}
 }
 
-// ── Positions ──────────────────────────────────────────────────────────────
+// ── Portfolio ──────────────────────────────────────────────────────────────
+function parseEventLabel(et) {
+  // KXMLBGAME-26MAY201905TORNYY → "TOR vs NYY — May 20"
+  const m = et.match(/-(\d{2})([A-Z]{3})(\d{2})\d{4}([A-Z]+)$/);
+  if (!m) return et;
+  const [, day, mon, , teams] = m;
+  const tl = teams.length;
+  let t1, t2;
+  if      (tl >= 6) { t1 = teams.slice(0,3); t2 = teams.slice(3); }
+  else if (tl === 5) { t1 = teams.slice(0,3); t2 = teams.slice(3); }
+  else               { t1 = teams.slice(0,2); t2 = teams.slice(2); }
+  return `${t1} vs ${t2} — ${mon} ${parseInt(day)}`;
+}
+
 async function loadPositions() {
   try {
-    const ps = await fetch('/api/positions').then(r => r.json());
-    const total = ps.reduce((s, p) => s + p.cost_usd, 0);
-    document.getElementById('p-count').textContent = ps.length || '0';
-    document.getElementById('p-risk').textContent  = '$' + total.toFixed(2);
+    const data = await fetch('/api/positions').then(r => r.json());
+    if (data.error) { console.error(data.error); return; }
+    const ps     = data.positions || [];
+    const events = data.events    || [];
 
+    // ── Summary stats ──────────────────────────────────────────────────────
+    const totalInvested   = ps.reduce((s, p) => s + (p.cost_usd  || 0), 0);
+    const totalContracts  = ps.reduce((s, p) => s + (p.contracts  || 0), 0);
+    const totalFees       = ps.reduce((s, p) => s + (p.fees_usd   || 0), 0);
+    const unrealVals      = ps.filter(p => p.unrealized_pnl != null).map(p => p.unrealized_pnl);
+    const totalUnreal     = unrealVals.length ? unrealVals.reduce((a,b) => a+b, 0) : null;
+
+    document.getElementById('p-count').textContent     = ps.length || '0';
+    document.getElementById('p-invested').textContent  = '$' + totalInvested.toFixed(2);
+    document.getElementById('p-contracts').textContent = totalContracts;
+    document.getElementById('p-fees').textContent      = '$' + totalFees.toFixed(2);
+    const unrealEl = document.getElementById('p-unrealized');
+    if (totalUnreal != null) {
+      unrealEl.textContent = (totalUnreal >= 0 ? '+' : '') + '$' + totalUnreal.toFixed(2);
+      unrealEl.className   = 'val ' + (totalUnreal >= 0 ? 'green' : 'red');
+    } else {
+      unrealEl.textContent = '—';
+      unrealEl.className   = 'val dim';
+    }
+
+    // ── Event exposure bars ────────────────────────────────────────────────
+    const barsEl  = document.getElementById('p-event-bars');
+    const maxCost = events.reduce((m, e) => Math.max(m, e.cost_usd), 0) || 1;
+    barsEl.innerHTML = events.map(e => {
+      const pct  = (e.cost_usd / maxCost * 100).toFixed(1);
+      const pctT = (e.cost_usd / (totalInvested || 1) * 100).toFixed(0);
+      const lbl  = parseEventLabel(e.event_ticker);
+      return `
+        <div style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+            <span>${lbl}</span>
+            <span class="yellow">$${e.cost_usd.toFixed(2)}</span>
+          </div>
+          <div style="background:#1a1a2e;border-radius:3px;height:8px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:linear-gradient(90deg,#4ea8de,#6c63ff);border-radius:3px"></div>
+          </div>
+          <div style="font-size:10px;color:#555;margin-top:2px">${e.contracts} contracts · ${pctT}% of portfolio</div>
+        </div>`;
+    }).join('');
+
+    // ── Positions table ────────────────────────────────────────────────────
     const tbody = document.getElementById('pos-body');
     if (!ps.length) {
-      tbody.innerHTML = '<tr><td colspan="7" class="empty">No open positions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No open positions</td></tr>';
       return;
     }
-    tbody.innerHTML = ps.map(p => `
-      <tr>
+    tbody.innerHTML = ps.map(p => {
+      const curCell = p.current_bid_cents != null
+        ? `<td class="${p.current_bid_cents > p.price_cents ? 'green' : p.current_bid_cents < p.price_cents ? 'red' : ''}">${p.current_bid_cents}¢</td>`
+        : '<td class="dim">—</td>';
+
+      const pnlSign = p.unrealized_pnl != null ? (p.unrealized_pnl >= 0 ? '+' : '') : '';
+      const pnlCell = p.unrealized_pnl != null
+        ? `<td class="${p.unrealized_pnl >= 0 ? 'green' : 'red'}">${pnlSign}$${p.unrealized_pnl.toFixed(2)}</td>`
+        : '<td class="dim">—</td>';
+
+      const slPt = (p.stop_loss_cents && p.profit_take_cents)
+        ? `<td style="font-size:11px"><span style="color:#ff6b6b">SL:${p.stop_loss_cents}¢</span> / <span style="color:#00ff88">PT:${p.profit_take_cents}¢</span></td>`
+        : '<td class="dim">—</td>';
+
+      return `<tr>
         <td>${p.player}</td>
-        <td class="dim" style="font-size:11px">${p.ticker}</td>
         <td>${p.contracts}</td>
-        <td>${p.price_cents}c</td>
-        <td class="yellow">$${p.cost_usd.toFixed(2)}</td>
-        <td><span class="src ${p.source}">${p.source}</span></td>
+        <td>${p.price_cents || '—'}¢</td>
+        ${curCell}
+        ${pnlCell}
+        <td class="yellow">$${(p.cost_usd||0).toFixed(2)}</td>
+        <td class="dim" style="font-size:11px">$${(p.fees_usd||0).toFixed(2)}</td>
+        ${slPt}
         <td class="dim" style="font-size:11px">${fmtTime(p.opened_at)}</td>
-      </tr>`).join('');
-  } catch(_) {}
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
 }
 
 // ── Orders ─────────────────────────────────────────────────────────────────
