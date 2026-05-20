@@ -423,6 +423,15 @@ _ALL_LOG_FILES = (
 )
 
 
+@app.route("/api/notifications/status")
+@_require_auth
+def api_notify_status():
+    return jsonify({
+        "enabled":    notifier.ENABLED,
+        "configured": bool(config.PUSHOVER_USER_KEY and config.PUSHOVER_APP_TOKEN),
+    })
+
+
 @app.route("/api/notifications/test", methods=["POST"])
 @_require_auth
 def api_notify_test():
@@ -1589,12 +1598,14 @@ async function stopScanner() {
 // ── Notifications ─────────────────────────────────────────────────────────
 async function loadNotifyState() {
   try {
-    const r = await fetch('/api/notifications/test', {method:'POST'});
-    const d = await r.json();
+    const d = await fetch('/api/notifications/status').then(r => r.json());
     const box = document.getElementById('chk-notify');
     if (box) box.checked = d.enabled;
     const msg = document.getElementById('notify-msg');
-    if (msg && !d.configured) msg.textContent = 'Keys not configured — add PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN to .env';
+    if (msg && !d.configured) {
+      msg.style.color = '#ff6b6b';
+      msg.textContent = 'Keys not configured — add PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN to .env';
+    }
   } catch(_) {}
 }
 
