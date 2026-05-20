@@ -360,6 +360,30 @@ def api_orders():
     return jsonify(list(reversed(orders[-200:])))
 
 
+@app.route("/api/logs/archive", methods=["POST"])
+@_require_auth
+def api_logs_archive():
+    ts  = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    moved = []
+    for f in (ORDERS_FILE, EXITS_FILE, PERF_CACHE_FILE):
+        if f.exists():
+            dest = f.with_name(f"{f.stem}_{ts}{f.suffix}")
+            f.rename(dest)
+            moved.append(dest.name)
+    executor._load_open_tickers()
+    return jsonify({"ok": True, "archived": moved})
+
+
+@app.route("/api/logs/clear", methods=["POST"])
+@_require_auth
+def api_logs_clear():
+    for f in (ORDERS_FILE, EXITS_FILE, PERF_CACHE_FILE):
+        if f.exists():
+            f.unlink()
+    executor._load_open_tickers()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/log")
 @_require_auth
 def api_log():
@@ -1105,6 +1129,20 @@ HTML = """<!DOCTYPE html>
     </div>
 
     <div class="setting-group">
+      <h3>Performance Logs</h3>
+      <p style="font-size:11px;color:#555;margin-bottom:12px">
+        Affects <code>orders.jsonl</code>, <code>exits.jsonl</code>, and <code>perf_cache.json</code>.
+        Archive renames them with a timestamp so history is preserved.
+        Clear deletes them permanently.
+      </p>
+      <div class="controls">
+        <button class="btn btn-gray" onclick="archiveLogs()">Archive Logs</button>
+        <button class="btn btn-red"  onclick="clearLogs()">Clear Logs</button>
+      </div>
+      <p id="log-action-msg" style="font-size:11px;color:#4caf;margin-top:8px"></p>
+    </div>
+
+    <div class="setting-group">
       <h3>Exit Rules</h3>
       <div class="cfg-row">
         <label>Stop-Loss</label>
@@ -1320,6 +1358,30 @@ async function startScanner(live) {
 async function stopScanner() {
   await fetch('/api/stop', {method: 'POST'});
   loadStatus();
+}
+
+// ── Log management ────────────────────────────────────────────────────────
+async function archiveLogs() {
+  if (!confirm('Archive orders.jsonl, exits.jsonl, and perf_cache.json?\\nFiles will be renamed with a timestamp.')) return;
+  const r = await fetch('/api/logs/archive', {method: 'POST'});
+  const d = await r.json();
+  const msg = document.getElementById('log-action-msg');
+  if (d.ok) {
+    msg.textContent = d.archived.length ? 'Archived: ' + d.archived.join(', ') : 'Nothing to archive.';
+    loadOrders();
+  } else {
+    msg.textContent = 'Error archiving logs.';
+  }
+}
+
+async function clearLogs() {
+  if (!confirm('Permanently delete orders.jsonl, exits.jsonl, and perf_cache.json?\\nThis cannot be undone.')) return;
+  if (!confirm('Are you sure? All performance history will be lost.')) return;
+  const r = await fetch('/api/logs/clear', {method: 'POST'});
+  const d = await r.json();
+  const msg = document.getElementById('log-action-msg');
+  msg.textContent = d.ok ? 'Logs cleared.' : 'Error clearing logs.';
+  if (d.ok) loadOrders();
 }
 
 // ── Config save ────────────────────────────────────────────────────────────
