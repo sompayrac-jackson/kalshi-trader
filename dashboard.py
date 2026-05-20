@@ -2217,6 +2217,13 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
+
+    # Auto-start scanner in dry-run mode at startup
+    _state["running"] = True
+    _state["dry_run"] = True
+    _scan_thread = threading.Thread(target=_scanner_loop, daemon=True, name="scanner")
+    _scan_thread.start()
+    print("Scanner auto-started in DRY RUN mode")
+
     print(f"Dashboard running at http://{args.host}:{args.port}")
-    print("Open http://localhost:{} in your browser".format(args.port))
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
