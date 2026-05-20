@@ -339,15 +339,17 @@ def _build_live_games() -> list[dict]:
     now    = datetime.now(timezone.utc)
     cards: list[dict] = []
 
-    # Kalshi live markets — occurrence_datetime < now, no result
+    # Tennis: occurrence_datetime = match start, so dt < now is correct.
+    # Baseball: occurrence_datetime = settlement deadline (~3h after start),
+    #           so we must NOT filter by time — let ESPN confirm liveness instead.
     raw: list[dict] = []
-    for series in ("KXATPMATCH", "KXWTAMATCH", "KXMLBGAME"):
+    for series in ("KXATPMATCH", "KXWTAMATCH"):
         for m in _fetch_kalshi_markets(series, now):
             if m["_live"]:
                 raw.append(m)
-
-    if not raw:
-        return []
+    for m in _fetch_kalshi_markets("KXMLBGAME", now):
+        if not m.get("result") and m.get("yes_ask_dollars"):
+            raw.append(m)  # include all open baseball markets; ESPN confirms liveness
 
     # ESPN live scores
     try:

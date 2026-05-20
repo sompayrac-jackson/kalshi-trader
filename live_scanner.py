@@ -360,12 +360,13 @@ def scan_live(client: KalshiClient) -> list[LiveSignal]:
         and datetime.fromisoformat(m["occurrence_datetime"].replace("Z", "+00:00")) < now
     ]
 
+    # Baseball: occurrence_datetime is the settlement deadline (~3h after first pitch),
+    # NOT the start time — filtering dt < now would exclude in-progress games.
+    # ESPN match confirms the game is actually live.
     baseball_markets = [
         m for m in client._get("/markets", params={"limit": 100, "series_ticker": "KXMLBGAME", "status": "open"}).get("markets", [])
         if not m.get("result")
         and m.get("yes_ask_dollars")
-        and m.get("occurrence_datetime")
-        and datetime.fromisoformat(m["occurrence_datetime"].replace("Z", "+00:00")) < now
     ]
 
     print(f"  {len(tennis_markets)} live Kalshi tennis markets")
