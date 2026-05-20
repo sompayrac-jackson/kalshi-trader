@@ -31,6 +31,13 @@ MIN_ASK     = 0.05    # skip if market prices YES below this — near-zero asks 
 STOP_LOSS_PCT   = 0.35   # sell if bid drops this fraction below entry price
 PROFIT_TAKE_PCT = 0.50   # sell if bid rises this fraction above entry price
 
+# ── Double Down Config ────────────────────────────────────────────────────────
+DOUBLE_DOWN_ENABLED    = False  # off by default — explicitly enabled via dashboard
+DOUBLE_DOWN_MIN_CONF   = 0.75   # min model_prob to consider adding on
+DOUBLE_DOWN_CONF_GAIN  = 0.10   # min confidence gain vs entry before adding
+DOUBLE_DOWN_MAX_ADDONS = 1      # max add-ons per ticker
+DOUBLE_DOWN_MAX_TOTAL  = 2.0    # max total position as multiple of MAX_BET_USD
+
 ORDERS_DRY_FILE  = Path("orders_dry.jsonl")
 ORDERS_LIVE_FILE = Path("orders_live.jsonl")
 EXITS_DRY_FILE   = Path("exits_dry.jsonl")
@@ -40,20 +47,28 @@ EXITS_LIVE_FILE  = Path("exits_live.jsonl")
 # Tickers we already hold (bought but not yet exited/settled).
 # Prevents re-buying the same live market every scan cycle.
 
-_open_tickers: set[str] = set()
+_open_tickers:  set[str]         = set()
+_addon_counts:  dict[str, int]   = {}   # ticker -> add-ons placed so far
+_position_cost: dict[str, float] = {}   # ticker -> total cost USD (initial + add-ons)
 
 
 def _load_open_tickers():
-    """Rebuild _open_tickers from all order logs minus exit logs at startup."""
-    global _open_tickers
-    bought: set[str] = set()
+    """Rebuild tracking state from all order logs minus exit logs at startup."""
+    global _open_tickers, _addon_counts, _position_cost
+    bought:    set[str]         = set()
+    addon_c:   dict[str, int]   = {}
+    pos_cost:  dict[str, float] = {}
     for f in (ORDERS_DRY_FILE, ORDERS_LIVE_FILE):
         if f.exists():
             for line in f.read_text(encoding="utf-8").splitlines():
                 try:
                     o = json.loads(line)
                     if o.get("status") in ("dry_run", "submitted", "resting", "executed") and o.get("contracts", 0) > 0:
-                        bought.add(o["ticker"])
+                        t = o["ticker"]
+                        bought.add(t)
+                        if o.get("is_addon"):
+                            addon_c[t] = addon_c.get(t, 0) + 1
+                        pos_cost[t] = pos_cost.get(t, 0.0) + float(o.get("cost_usd", 0))
                 except Exception:
                     pass
     exited: set[str] = set()
@@ -64,7 +79,9 @@ def _load_open_tickers():
                     exited.add(json.loads(line)["ticker"])
                 except Exception:
                     pass
-    _open_tickers = bought - exited
+    _open_tickers  = bought - exited
+    _addon_counts  = {t: v for t, v in addon_c.items()  if t not in exited}
+    _position_cost = {t: v for t, v in pos_cost.items() if t not in exited}
 
 
 _load_open_tickers()
@@ -84,9 +101,10 @@ class OrderResult:
     edge:         float
     source:       str      # 'arb' or 'live'
     dry_run:      bool
-    order_id:     str = ""
-    status:       str = ""
-    error:        str = ""
+    order_id:     str  = ""
+    status:       str  = ""
+    error:        str  = ""
+    is_addon:     bool = False
 
 
 @dataclass
@@ -204,6 +222,7 @@ def execute(
         result.status   = "dry_run"
         result.order_id = f"dry-{uuid.uuid4().hex[:8]}"
         _open_tickers.add(ticker)
+        _position_cost[ticker] = cost_usd
         _print(result)
         _log(result)
         return result
@@ -220,6 +239,7 @@ def execute(
         result.status   = resp.get("order", {}).get("status", "submitted")
         if result.status in ("submitted", "resting", "executed"):
             _open_tickers.add(ticker)
+            _position_cost[ticker] = cost_usd
             notifier.notify_buy(ticker, player, side, contracts,
                                 price_cents, cost_usd, edge)
         _print(result)
@@ -304,6 +324,8 @@ def execute_exit(
         result.status   = "dry_run"
         result.order_id = f"dry-exit-{uuid.uuid4().hex[:8]}"
         _open_tickers.discard(ticker)
+        _addon_counts.pop(ticker, None)
+        _position_cost.pop(ticker, None)
         _log_exit(result)
         return result
 
@@ -317,6 +339,8 @@ def execute_exit(
         result.order_id = resp.get("order", {}).get("order_id", "")
         result.status   = resp.get("order", {}).get("status", "submitted")
         _open_tickers.discard(ticker)
+        _addon_counts.pop(ticker, None)
+        _position_cost.pop(ticker, None)
         notifier.notify_sell(ticker, side, contracts,
                              entry_cents, bid_cents, pnl_usd, reason)
         _log_exit(result)
@@ -324,6 +348,112 @@ def execute_exit(
         result.status = "error"
         result.error  = str(e)
         _log_exit(result)
+
+    return result
+
+
+# ── Add-on executor ──────────────────────────────────────────────────────────
+
+def execute_addon(
+    client: KalshiClient,
+    ticker: str,
+    player: str,
+    side: str,
+    ask_dollars: float,
+    kelly_usd: float,
+    edge: float,
+) -> OrderResult:
+    """
+    Add to an existing position (double-down).
+    Bypasses the _open_tickers dedup check; all other guards still apply.
+    Call only after the caller has verified double-down conditions are met.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+
+    if ask_dollars < MIN_ASK:
+        return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, "live",
+                     f"yes_ask {ask_dollars:.2f} below min {MIN_ASK:.2f}")
+
+    bet_usd = min(kelly_usd, MAX_BET_USD)
+    if bet_usd < MIN_BET_USD:
+        return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, "live",
+                     f"bet ${bet_usd:.2f} below minimum ${MIN_BET_USD:.2f}")
+
+    price = ask_dollars if side == "yes" else 1 - ask_dollars
+    if price <= 0:
+        return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, "live",
+                     "invalid price")
+
+    contracts   = max(1, int(bet_usd / price))
+    cost_usd    = contracts * price
+    price_cents = round(ask_dollars * 100)
+
+    result = OrderResult(
+        ts=ts, ticker=ticker, player=player, side=side,
+        contracts=contracts, price_cents=price_cents, cost_usd=cost_usd,
+        edge=edge, source="live", dry_run=DRY_RUN, is_addon=True,
+    )
+
+    # Balance check
+    try:
+        balance = client.get_balance().get("balance", 0) / 100
+        if cost_usd > balance:
+            result.status = "skipped"
+            result.error  = f"insufficient balance ${balance:.2f} < ${cost_usd:.2f}"
+            _log(result)
+            return result
+    except Exception as e:
+        result.status = "error"
+        result.error  = f"balance check failed: {e}"
+        _log(result)
+        return result
+
+    # Liquidity check
+    try:
+        market = client.get_market(ticker)
+        size_field = "yes_ask_size_fp" if side == "yes" else "no_ask_size_fp"
+        available  = float(market.get(size_field) or 0)
+        if available < contracts:
+            result.status = "skipped"
+            result.error  = f"insufficient liquidity: need {contracts}, available {available:.0f}"
+            _log(result)
+            return result
+    except Exception as e:
+        result.status = "error"
+        result.error  = f"liquidity check failed: {e}"
+        _log(result)
+        return result
+
+    if DRY_RUN:
+        result.status   = "dry_run"
+        result.order_id = f"dry-addon-{uuid.uuid4().hex[:8]}"
+        _addon_counts[ticker]  = _addon_counts.get(ticker, 0) + 1
+        _position_cost[ticker] = _position_cost.get(ticker, 0.0) + cost_usd
+        _print(result)
+        _log(result)
+        return result
+
+    try:
+        resp = client.place_order(
+            ticker=ticker,
+            side=side,
+            count=contracts,
+            yes_price=price_cents,
+            order_type="limit",
+        )
+        result.order_id = resp.get("order", {}).get("order_id", "")
+        result.status   = resp.get("order", {}).get("status", "submitted")
+        if result.status in ("submitted", "resting", "executed"):
+            _addon_counts[ticker]  = _addon_counts.get(ticker, 0) + 1
+            _position_cost[ticker] = _position_cost.get(ticker, 0.0) + cost_usd
+            notifier.notify_buy(ticker, player, side, contracts,
+                                price_cents, cost_usd, edge)
+        _print(result)
+        _log(result)
+    except Exception as e:
+        result.status = "error"
+        result.error  = str(e)
+        _log(result)
 
     return result
 
@@ -341,10 +471,11 @@ def _skip(ts, ticker, player, side, ask, kelly, edge, source, reason) -> OrderRe
 
 
 def _print(r: OrderResult):
-    tag = "[DRY RUN]" if r.dry_run else "[LIVE]"
+    tag    = "[DRY RUN]" if r.dry_run else "[LIVE]"
+    action = "ADDON" if r.is_addon else "BUY "
     print(
         f"{tag} {r.source.upper():4}  {r.player:<25} "
-        f"BUY {r.contracts} YES @ {r.price_cents}¢  "
+        f"{action} {r.contracts} YES @ {r.price_cents}¢  "
         f"cost=${r.cost_usd:.2f}  edge={r.edge:+.1%}  "
         f"id={r.order_id}  status={r.status}"
     )

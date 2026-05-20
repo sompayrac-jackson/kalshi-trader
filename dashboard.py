@@ -101,14 +101,19 @@ _state: dict = {
     "signals":        [],
     "log":            [],
     "config": {
-        "min_edge":          0.04,
-        "max_bet_usd":       25.0,
-        "kelly_fraction":    0.5,
-        "arb_interval_sec":  300,
-        "live_interval_sec": 30,
-        "stop_loss_pct":     0.35,
-        "profit_take_pct":   0.50,
-        "min_ask":           0.05,
+        "min_edge":              0.04,
+        "max_bet_usd":           25.0,
+        "kelly_fraction":        0.5,
+        "arb_interval_sec":      300,
+        "live_interval_sec":     30,
+        "stop_loss_pct":         0.35,
+        "profit_take_pct":       0.50,
+        "min_ask":               0.05,
+        "double_down_enabled":   False,
+        "double_down_min_conf":  0.75,
+        "double_down_conf_gain": 0.10,
+        "double_down_max_addons": 1,
+        "double_down_max_total":  2.0,
     },
 }
 
@@ -143,14 +148,19 @@ def _to_dict(sig, source: str) -> dict:
 def _sync_executor_config():
     """Push dashboard config sliders into scanner and executor module globals."""
     cfg = _state["config"]
-    executor.DRY_RUN        = _state["dry_run"]
-    executor.MIN_EDGE       = cfg["min_edge"]
-    executor.MAX_BET_USD    = cfg["max_bet_usd"]
-    executor.STOP_LOSS_PCT   = cfg["stop_loss_pct"]
-    executor.PROFIT_TAKE_PCT = cfg["profit_take_pct"]
-    executor.MIN_ASK         = cfg["min_ask"]
-    live_mod.MIN_EDGE       = cfg["min_edge"]
-    live_mod.KELLY_FRACTION = cfg["kelly_fraction"]
+    executor.DRY_RUN             = _state["dry_run"]
+    executor.MIN_EDGE            = cfg["min_edge"]
+    executor.MAX_BET_USD         = cfg["max_bet_usd"]
+    executor.STOP_LOSS_PCT       = cfg["stop_loss_pct"]
+    executor.PROFIT_TAKE_PCT     = cfg["profit_take_pct"]
+    executor.MIN_ASK             = cfg["min_ask"]
+    executor.DOUBLE_DOWN_ENABLED    = bool(cfg.get("double_down_enabled", False))
+    executor.DOUBLE_DOWN_MIN_CONF   = float(cfg.get("double_down_min_conf", 0.75))
+    executor.DOUBLE_DOWN_CONF_GAIN  = float(cfg.get("double_down_conf_gain", 0.10))
+    executor.DOUBLE_DOWN_MAX_ADDONS = int(cfg.get("double_down_max_addons", 1))
+    executor.DOUBLE_DOWN_MAX_TOTAL  = float(cfg.get("double_down_max_total", 2.0))
+    live_mod.MIN_EDGE            = cfg["min_edge"]
+    live_mod.KELLY_FRACTION      = cfg["kelly_fraction"]
 
 
 def _scale_exits(cost_usd: float, base_sl: float, base_pt: float, cfg: dict) -> tuple:
@@ -314,6 +324,84 @@ def _check_exits(client: KalshiClient):
             _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
 
 
+def _check_double_downs(client: KalshiClient):
+    """
+    After each live scan, check open positions for double-down eligibility.
+    Adds to a position when model confidence has materially increased since entry.
+    """
+    cfg = _state["config"]
+    if not cfg.get("double_down_enabled", False):
+        return
+
+    min_conf   = float(cfg.get("double_down_min_conf",  0.75))
+    conf_gain  = float(cfg.get("double_down_conf_gain", 0.10))
+    max_addons = int(cfg.get("double_down_max_addons",  1))
+    max_total  = float(cfg.get("double_down_max_total", 2.0))
+    max_bet    = float(cfg.get("max_bet_usd", 25.0))
+    max_total_usd = max_total * max_bet
+
+    with _lock:
+        sig_by_ticker = {s["ticker"]: s for s in _state["signals"]}
+
+    # Reconstruct entry model confidence from initial order log (non-addon entries only)
+    dry_run  = _state["dry_run"]
+    orders_f = executor.ORDERS_DRY_FILE if dry_run else executor.ORDERS_LIVE_FILE
+    entry_conf: dict[str, float] = {}
+    if orders_f.exists():
+        for line in orders_f.read_text(encoding="utf-8").splitlines():
+            try:
+                o = json.loads(line)
+                t = o.get("ticker", "")
+                if (t and t not in entry_conf
+                        and o.get("contracts", 0) > 0
+                        and not o.get("is_addon")):
+                    ec   = float(o.get("price_cents", 0)) / 100
+                    edge = float(o.get("edge", 0.0))
+                    entry_conf[t] = max(0.5, min(0.99, ec + edge))
+            except Exception:
+                pass
+
+    for ticker in list(executor._open_tickers):
+        sig = sig_by_ticker.get(ticker)
+        if not sig:
+            continue
+
+        current_conf = float(sig.get("model_prob", 0))
+        if current_conf < min_conf:
+            continue
+
+        base_conf = entry_conf.get(ticker, 0.5)
+        if (current_conf - base_conf) < conf_gain:
+            continue
+
+        if executor._addon_counts.get(ticker, 0) >= max_addons:
+            continue
+
+        if executor._position_cost.get(ticker, 0.0) >= max_total_usd:
+            continue
+
+        edge = float(sig.get("edge", 0))
+        if edge <= executor.MIN_EDGE:
+            continue
+
+        _log(f"[DD] {ticker}: conf={current_conf:.0%} (was {base_conf:.0%}) "
+             f"addons={executor._addon_counts.get(ticker,0)} "
+             f"cost=${executor._position_cost.get(ticker,0):.2f} — placing add-on")
+        try:
+            r = executor.execute_addon(
+                client=client,
+                ticker=ticker,
+                player=sig.get("player", ticker),
+                side="yes",
+                ask_dollars=float(sig.get("kalshi_ask", 0)),
+                kelly_usd=float(sig.get("kelly_usd", 0)),
+                edge=edge,
+            )
+            _log(f"[DD] {ticker} add-on — {r.status} {r.error or ''}")
+        except Exception as e:
+            _log(f"[DD] execute_addon error {ticker}: {e}")
+
+
 def _scanner_loop():
     global _client
     _client  = KalshiClient(api_key_id=KALSHI_API_KEY)
@@ -384,6 +472,12 @@ def _scanner_loop():
             _check_exits(_client)
         except Exception as e:
             _log(f"[EXIT] check error: {e}")
+
+        # Double-down check — runs if enabled
+        try:
+            _check_double_downs(_client)
+        except Exception as e:
+            _log(f"[DD] check error: {e}")
 
         _stop_event.wait(cfg["live_interval_sec"])
 
@@ -693,15 +787,20 @@ def api_stop():
 
 
 _CONFIG_BOUNDS = {
-    "min_edge":          (0.01, 0.50),
-    "max_bet_usd":       (1.0,  500.0),
-    "kelly_fraction":    (0.05, 1.0),
-    "arb_interval_sec":  (300,  86400),
-    "live_interval_sec": (10,   300),
-    "stop_loss_pct":     (0.10, 0.60),
-    "profit_take_pct":   (0.20, 0.90),
-    "min_ask":           (0.02, 0.25),
+    "min_edge":               (0.01, 0.50),
+    "max_bet_usd":            (1.0,  500.0),
+    "kelly_fraction":         (0.05, 1.0),
+    "arb_interval_sec":       (300,  86400),
+    "live_interval_sec":      (10,   300),
+    "stop_loss_pct":          (0.10, 0.60),
+    "profit_take_pct":        (0.20, 0.90),
+    "min_ask":                (0.02, 0.25),
+    "double_down_min_conf":   (0.55, 0.95),
+    "double_down_conf_gain":  (0.05, 0.30),
+    "double_down_max_addons": (1,    5),
+    "double_down_max_total":  (1.0,  5.0),
 }
+_CONFIG_BOOLS = {"double_down_enabled"}
 
 @app.route("/api/config", methods=["POST"])
 @_require_auth
@@ -710,6 +809,9 @@ def api_config():
     errors = []
     updates = {}
     for k, v in data.items():
+        if k in _CONFIG_BOOLS:
+            updates[k] = bool(v)
+            continue
         if k not in _CONFIG_BOUNDS:
             continue
         try:
@@ -728,6 +830,8 @@ def api_config():
         _state["config"].update(updates)
     if "min_edge"    in updates: executor.MIN_EDGE    = updates["min_edge"]
     if "max_bet_usd" in updates: executor.MAX_BET_USD = updates["max_bet_usd"]
+    if "double_down_enabled" in updates:
+        executor.DOUBLE_DOWN_ENABLED = updates["double_down_enabled"]
     return jsonify({"ok": True, "config": _state["config"]})
 
 
@@ -1528,6 +1632,54 @@ HTML = """<!DOCTYPE html>
       <button class="btn btn-gray" onclick="saveConfig()" style="margin-top:6px">Save Config</button>
     </div>
 
+    <div class="setting-group">
+      <h3>Double Down</h3>
+      <p style="font-size:11px;color:#555;margin-bottom:12px">
+        Automatically add to an existing position when model confidence has materially increased since entry.
+        <strong>Disabled by default</strong> — enable with caution in live mode.
+      </p>
+      <div class="controls" style="align-items:center;gap:16px;margin-bottom:14px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="chk-dd" onchange="toggleDoubleDown(this.checked)" style="width:16px;height:16px">
+          Enable Double Down
+        </label>
+      </div>
+      <div class="cfg-row">
+        <label>Min Confidence</label>
+        <input type="range" id="rng-dd-min-conf" min="55" max="95" step="5"
+               oninput="showVal('dd-min-conf', this.value+'%')">
+        <span class="cfg-val" id="val-dd-min-conf">75%</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:8px">
+        Current model probability must exceed this before adding to a position.
+      </p>
+      <div class="cfg-row">
+        <label>Min Conf Gain</label>
+        <input type="range" id="rng-dd-conf-gain" min="5" max="30" step="5"
+               oninput="showVal('dd-conf-gain', this.value+'%')">
+        <span class="cfg-val" id="val-dd-conf-gain">10%</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:8px">
+        Confidence must have risen by at least this much since entry.
+      </p>
+      <div class="cfg-row">
+        <label>Max Add-Ons</label>
+        <input type="range" id="rng-dd-max-addons" min="1" max="5" step="1"
+               oninput="showVal('dd-max-addons', this.value)">
+        <span class="cfg-val" id="val-dd-max-addons">1</span>
+      </div>
+      <div class="cfg-row">
+        <label>Max Total (×Max Bet)</label>
+        <input type="range" id="rng-dd-max-total" min="10" max="50" step="5"
+               oninput="showVal('dd-max-total', (this.value/10).toFixed(1)+'×')">
+        <span class="cfg-val" id="val-dd-max-total">2.0×</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:12px">
+        Total position cost cap as a multiple of Max Bet. At 2×: $50 cap with $25 max bet.
+      </p>
+      <button class="btn btn-gray" onclick="saveConfig()" style="margin-top:6px">Save Config</button>
+    </div>
+
   </div>
 
 </div><!-- /content -->
@@ -1613,6 +1765,17 @@ function syncSliders(cfg) {
            Math.round((cfg.min_ask || 0.05) * 100) + '¢');
   const arbH = Math.max(1, Math.round(cfg.arb_interval_sec / 3600));
   setValue('arb-int', arbH, arbH + 'h');
+  // Double Down
+  const chkDd = document.getElementById('chk-dd');
+  if (chkDd) chkDd.checked = !!cfg.double_down_enabled;
+  const ddConf = Math.round((cfg.double_down_min_conf  || 0.75) * 100);
+  const ddGain = Math.round((cfg.double_down_conf_gain || 0.10) * 100);
+  const ddMax  = cfg.double_down_max_addons || 1;
+  const ddTot  = Math.round((cfg.double_down_max_total || 2.0) * 10);
+  setValue('dd-min-conf',   ddConf, ddConf + '%');
+  setValue('dd-conf-gain',  ddGain, ddGain + '%');
+  setValue('dd-max-addons', ddMax,  String(ddMax));
+  setValue('dd-max-total',  ddTot,  (ddTot/10).toFixed(1) + '×');
 }
 
 function setValue(id, rngVal, display) {
@@ -2024,6 +2187,13 @@ async function clearLogs(mode) {
 }
 
 // ── Config save ────────────────────────────────────────────────────────────
+async function toggleDoubleDown(enabled) {
+  await fetch('/api/config', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({double_down_enabled: enabled})
+  });
+}
+
 async function saveConfig() {
   const payload = {
     min_edge:          parseFloat(document.getElementById('rng-min-edge').value) / 100,
@@ -2034,6 +2204,10 @@ async function saveConfig() {
     stop_loss_pct:     parseFloat(document.getElementById('rng-stop-loss').value) / 100,
     profit_take_pct:   parseFloat(document.getElementById('rng-profit-take').value) / 100,
     min_ask:           parseFloat(document.getElementById('rng-min-ask').value) / 100,
+    double_down_min_conf:   parseFloat(document.getElementById('rng-dd-min-conf').value) / 100,
+    double_down_conf_gain:  parseFloat(document.getElementById('rng-dd-conf-gain').value) / 100,
+    double_down_max_addons: parseFloat(document.getElementById('rng-dd-max-addons').value),
+    double_down_max_total:  parseFloat(document.getElementById('rng-dd-max-total').value) / 10,
   };
   const r = await fetch('/api/config', {
     method: 'POST',
