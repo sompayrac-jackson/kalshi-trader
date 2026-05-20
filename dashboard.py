@@ -153,6 +153,18 @@ def _sync_executor_config():
     live_mod.KELLY_FRACTION = cfg["kelly_fraction"]
 
 
+def _scale_exits(cost_usd: float, base_sl: float, base_pt: float, cfg: dict) -> tuple:
+    """
+    Scale SL/PT thresholds by position size.
+    Small positions get wider bands (1.5× base); full-size gets tighter (0.75× base).
+    Linear interpolation between the two extremes.
+    """
+    ceiling = max(float(cfg.get("max_bet_usd", 25.0)), 1.0)
+    t = min(cost_usd / ceiling, 1.0)   # 0 = tiny, 1 = full-size or larger
+    scale = 1.5 + t * (0.75 - 1.5)     # 1.5× → 0.75×
+    return base_sl * scale, base_pt * scale
+
+
 def _check_exits(client: KalshiClient):
     """
     Scan open positions (real in live mode, virtual from orders.jsonl in dry-run)
@@ -242,6 +254,13 @@ def _check_exits(client: KalshiClient):
         if entry_cents <= 0:
             continue
 
+        # Cost-weighted exit thresholds
+        if virtual:
+            cost_usd = entry_cents / 100 * net_pos
+        else:
+            cost_usd = float(pos.get("market_exposure_dollars", 0)) or entry_cents / 100 * net_pos
+        sl_pct, pt_pct = _scale_exits(cost_usd, stop_loss_pct, profit_take_pct, cfg)
+
         try:
             market      = client.get_market(ticker)
             bid_dollars = float(market.get("yes_bid_dollars") or 0)
@@ -258,12 +277,12 @@ def _check_exits(client: KalshiClient):
         rise = (bid_dollars - entry_dollars) / entry_dollars
         tag  = "[DRY] " if virtual else ""
 
-        if drop >= stop_loss_pct:
-            _log(f"[EXIT] {tag}STOP-LOSS {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ drop={drop:.1%}")
+        if drop >= sl_pct:
+            _log(f"[EXIT] {tag}STOP-LOSS {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ drop={drop:.1%} sl={sl_pct:.0%} (cost=${cost_usd:.2f})")
             r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "stop_loss")
             _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
-        elif rise >= profit_take_pct:
-            _log(f"[EXIT] {tag}PROFIT-TAKE {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ rise={rise:.1%}")
+        elif rise >= pt_pct:
+            _log(f"[EXIT] {tag}PROFIT-TAKE {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ rise={rise:.1%} pt={pt_pct:.0%} (cost=${cost_usd:.2f})")
             r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "profit_take")
             _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
 
@@ -368,7 +387,9 @@ def api_signals():
 @_require_auth
 def api_positions():
     try:
-        raw = client.get_positions().get("market_positions", [])
+        if _client is None:
+            return jsonify([])
+        raw = _client.get_positions().get("market_positions", [])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -423,9 +444,9 @@ def api_orders():
         except Exception:
             pass
 
-    cfg = _state["config"]
-    sl_pct = cfg.get("stop_loss_pct", 0.35)
-    pt_pct = cfg.get("profit_take_pct", 0.50)
+    cfg    = _state["config"]
+    sl_base = cfg.get("stop_loss_pct", 0.35)
+    pt_base = cfg.get("profit_take_pct", 0.50)
 
     with _price_lock:
         prices = dict(_price_cache)
@@ -436,6 +457,7 @@ def api_orders():
         o["current_bid_cents"]  = round(bid * 100) if bid else None
         ec = o.get("price_cents", 0)
         if ec > 0:
+            sl_pct, pt_pct = _scale_exits(o.get("cost_usd", 0), sl_base, pt_base, cfg)
             o["stop_loss_cents"]   = round(ec * (1 - sl_pct))
             o["profit_take_cents"] = min(99, round(ec * (1 + pt_pct)))
         else:
