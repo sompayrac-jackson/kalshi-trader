@@ -283,6 +283,124 @@ def api_config():
     return jsonify({"ok": True, "config": _state["config"]})
 
 
+# ── Upcoming games ────────────────────────────────────────────────────────────
+
+_upcoming_cache: dict = {"data": [], "ts": 0.0}
+_upcoming_lock  = threading.Lock()
+UPCOMING_TTL    = 120   # seconds before refreshing from Kalshi
+UPCOMING_WINDOW = 48    # hours ahead to show
+
+
+def _get_client() -> KalshiClient:
+    """Return the running scanner client, or create a temporary one."""
+    if _client is not None:
+        return _client
+    return KalshiClient(api_key_id=KALSHI_API_KEY)
+
+
+def _fetch_upcoming() -> list[dict]:
+    """
+    Fetch Kalshi markets starting in the next UPCOMING_WINDOW hours.
+    Groups both sides of the same match by event_ticker.
+    """
+    now   = datetime.now(timezone.utc)
+    cutoff_iso = now.isoformat()
+    client = _get_client()
+
+    raw_markets: list[dict] = []
+    for series in ("KXATPMATCH", "KXWTAMATCH", "KXMLBGAME"):
+        sport = "baseball" if series == "KXMLBGAME" else "tennis"
+        try:
+            resp = client._get("/markets", params={
+                "limit": 200, "series_ticker": series, "status": "open"
+            })
+            for m in resp.get("markets", []):
+                odt = m.get("occurrence_datetime", "")
+                if not odt:
+                    continue
+                dt = datetime.fromisoformat(odt.replace("Z", "+00:00"))
+                hours_until = (dt - now).total_seconds() / 3600
+                # Only pre-match games in the next UPCOMING_WINDOW hours
+                if not (0 < hours_until <= UPCOMING_WINDOW):
+                    continue
+                if m.get("result"):
+                    continue
+                m["_sport"]       = sport
+                m["_hours_until"] = hours_until
+                m["_dt"]          = dt
+                raw_markets.append(m)
+        except Exception as e:
+            _log(f"[upcoming] {series} fetch error: {e}")
+
+    # Group by event_ticker — each event has two markets (one per side)
+    events: dict[str, list[dict]] = {}
+    for m in raw_markets:
+        key = m.get("event_ticker") or m.get("ticker", "")
+        events.setdefault(key, []).append(m)
+
+    result: list[dict] = []
+    for event_key, sides in events.items():
+        # Pick the earliest occurrence_datetime as the event time
+        sides.sort(key=lambda m: m["_dt"])
+        first     = sides[0]
+        dt        = first["_dt"]
+        mins_until = int((dt - now).total_seconds() / 60)
+
+        # Build per-side entries
+        parsed_sides = []
+        for m in sides:
+            title = m.get("title", "")
+            # Tennis title: "Will X win ..."
+            import re
+            tennis_match = re.match(r"Will (.+?) win", title)
+            sub = (m.get("yes_sub_title") or m.get("no_sub_title") or "").strip()
+            if tennis_match:
+                player = tennis_match.group(1)
+            elif sub:
+                player = sub
+            else:
+                player = title or m.get("ticker", "").split("-")[-1]
+
+            ask = m.get("yes_ask_dollars")
+            bid = m.get("yes_bid_dollars")
+            parsed_sides.append({
+                "ticker": m.get("ticker", ""),
+                "player": player,
+                "ask":    round(float(ask), 2) if ask else None,
+                "bid":    round(float(bid), 2) if bid else None,
+            })
+
+        result.append({
+            "event_ticker": event_key,
+            "sport":        first["_sport"],
+            "starts_at":    dt.isoformat(),
+            "mins_until":   mins_until,
+            "sides":        parsed_sides,
+        })
+
+    result.sort(key=lambda e: e["mins_until"])
+    return result
+
+
+@app.route("/api/upcoming")
+@_require_auth
+def api_upcoming():
+    with _upcoming_lock:
+        if time.time() - _upcoming_cache["ts"] < UPCOMING_TTL:
+            return jsonify(_upcoming_cache["data"])
+
+    try:
+        data = _fetch_upcoming()
+    except Exception as e:
+        _log(f"[upcoming] fetch failed: {e}")
+        return jsonify([])
+
+    with _upcoming_lock:
+        _upcoming_cache["data"] = data
+        _upcoming_cache["ts"]   = time.time()
+    return jsonify(data)
+
+
 @app.route("/")
 @_require_auth
 def index():
@@ -384,6 +502,29 @@ HTML = """<!DOCTYPE html>
   .st.dry_run{color:#888}
   .st.submitted,.st.resting{color:#00ff88}
   .st.skipped,.st.error{color:#ff6b6b}
+
+  /* Upcoming fixtures */
+  .fixture-group{margin-bottom:10px}
+  .fixture-group-header{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.08em;padding:6px 0 4px;border-bottom:1px solid #1e1e1e;margin-bottom:4px}
+  .fixture{display:flex;align-items:center;background:#111;border:1px solid #1e1e1e;border-radius:5px;padding:12px 16px;margin-bottom:6px;gap:0;transition:border-color .15s}
+  .fixture:hover{border-color:#2a2a2a}
+  .fixture.soon{border-left:3px solid #ffcc00}
+  .fixture.imminent{border-left:3px solid #ff6b6b}
+  .fix-sport{width:52px;font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.05em;flex-shrink:0}
+  .fix-teams{flex:1;display:flex;align-items:center;gap:10px}
+  .fix-side{flex:1}
+  .fix-name{font-size:13px;color:#ddd}
+  .fix-price{font-size:12px;color:#555;margin-top:2px}
+  .fix-price span{color:#aaa}
+  .fix-vs{color:#333;font-size:12px;flex-shrink:0;padding:0 4px}
+  .fix-time{width:110px;text-align:right;flex-shrink:0}
+  .fix-countdown{font-size:13px;font-weight:bold}
+  .fix-countdown.near{color:#ffcc00}
+  .fix-countdown.hot{color:#ff6b6b}
+  .fix-countdown.ok{color:#555}
+  .fix-date{font-size:10px;color:#444;margin-top:2px}
+  .fix-sport-icon{font-size:15px;margin-right:4px}
+  .no-upcoming{color:#444;text-align:center;padding:40px;font-size:12px}
 </style>
 </head>
 <body>
@@ -397,6 +538,7 @@ HTML = """<!DOCTYPE html>
 
 <div class="tabs">
   <div class="tab active" onclick="showTab('signals')">Signals</div>
+  <div class="tab" onclick="showTab('upcoming')">Upcoming</div>
   <div class="tab" onclick="showTab('positions')">Positions</div>
   <div class="tab" onclick="showTab('orders')">Orders</div>
   <div class="tab" onclick="showTab('log')">Log</div>
@@ -424,6 +566,17 @@ HTML = """<!DOCTYPE html>
         <tbody id="sig-body"></tbody>
       </table>
     </div>
+  </div>
+
+  <!-- UPCOMING -->
+  <div class="panel" id="panel-upcoming">
+    <div class="stats">
+      <div class="card"><div class="lbl">Events (48h)</div><div class="val" id="u-count">-</div></div>
+      <div class="card"><div class="lbl">Starting Soon (&lt;2h)</div><div class="val yellow" id="u-soon">-</div></div>
+      <div class="card"><div class="lbl">Tennis</div><div class="val" id="u-tennis">-</div></div>
+      <div class="card"><div class="lbl">Baseball</div><div class="val" id="u-baseball">-</div></div>
+    </div>
+    <div id="upcoming-body"></div>
   </div>
 
   <!-- POSITIONS -->
@@ -512,11 +665,12 @@ HTML = """<!DOCTYPE html>
 let currentTab = 'signals';
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t, i) =>
-    t.classList.toggle('active', ['signals','positions','orders','log','settings'][i] === name)
+    t.classList.toggle('active', ['signals','upcoming','positions','orders','log','settings'][i] === name)
   );
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.getElementById('panel-' + name).classList.add('active');
   currentTab = name;
+  if (name === 'upcoming')  loadUpcoming();
   if (name === 'positions') loadPositions();
   if (name === 'orders')    loadOrders();
   if (name === 'log')       loadLog();
@@ -704,10 +858,101 @@ async function saveConfig() {
   loadStatus();
 }
 
+// ── Upcoming games ─────────────────────────────────────────────────────────
+function fmtCountdown(mins) {
+  if (mins <= 0)   return 'NOW';
+  if (mins < 60)   return mins + 'm';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return h + 'h' + (m ? ' ' + m + 'm' : '');
+}
+function countdownClass(mins) {
+  if (mins <= 60)  return 'hot';
+  if (mins <= 120) return 'near';
+  return 'ok';
+}
+function fmtStartTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'})
+       + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+async function loadUpcoming() {
+  try {
+    const events = await fetch('/api/upcoming').then(r => r.json());
+    const soon = events.filter(e => e.mins_until <= 120).length;
+    const tennis   = events.filter(e => e.sport === 'tennis').length;
+    const baseball = events.filter(e => e.sport === 'baseball').length;
+
+    document.getElementById('u-count').textContent   = events.length || '0';
+    document.getElementById('u-soon').textContent    = soon || '0';
+    document.getElementById('u-tennis').textContent  = tennis || '0';
+    document.getElementById('u-baseball').textContent = baseball || '0';
+
+    const container = document.getElementById('upcoming-body');
+    if (!events.length) {
+      container.innerHTML = '<div class="no-upcoming">No upcoming markets found in the next 48 hours.<br>Check back closer to game time.</div>';
+      return;
+    }
+
+    // Group by time bucket
+    const buckets = {'Starting Soon (< 2h)': [], 'Today': [], 'Tomorrow': []};
+    const todayDate = new Date().toDateString();
+    events.forEach(e => {
+      const d = new Date(e.starts_at);
+      if (e.mins_until <= 120)                  buckets['Starting Soon (< 2h)'].push(e);
+      else if (d.toDateString() === todayDate)  buckets['Today'].push(e);
+      else                                       buckets['Tomorrow'].push(e);
+    });
+
+    let html = '';
+    for (const [label, group] of Object.entries(buckets)) {
+      if (!group.length) continue;
+      html += `<div class="fixture-group">
+        <div class="fixture-group-header">${label} &mdash; ${group.length} event${group.length > 1 ? 's' : ''}</div>`;
+
+      for (const e of group) {
+        const icon      = e.sport === 'tennis' ? '&#127934;' : '&#9918;';
+        const cdCls     = countdownClass(e.mins_until);
+        const fixCls    = e.mins_until <= 60 ? 'imminent' : e.mins_until <= 120 ? 'soon' : '';
+        const sides     = e.sides;
+        const sideA     = sides[0] || {};
+        const sideB     = sides[1] || {};
+        const priceA    = sideA.ask != null ? Math.round(sideA.ask * 100) + 'c' : '-';
+        const priceB    = sideB.ask != null ? Math.round(sideB.ask * 100) + 'c' : '-';
+
+        html += `<div class="fixture ${fixCls}">
+          <div class="fix-sport"><span class="fix-sport-icon">${icon}</span>${e.sport}</div>
+          <div class="fix-teams">
+            <div class="fix-side" style="text-align:right">
+              <div class="fix-name">${sideA.player || '—'}</div>
+              <div class="fix-price">ask <span>${priceA}</span></div>
+            </div>
+            <div class="fix-vs">vs</div>
+            <div class="fix-side">
+              <div class="fix-name">${sideB.player || '—'}</div>
+              <div class="fix-price">ask <span>${priceB}</span></div>
+            </div>
+          </div>
+          <div class="fix-time">
+            <div class="fix-countdown ${cdCls}">${fmtCountdown(e.mins_until)}</div>
+            <div class="fix-date">${fmtStartTime(e.starts_at)}</div>
+          </div>
+        </div>`;
+      }
+      html += '</div>';
+    }
+    container.innerHTML = html;
+  } catch(err) {
+    document.getElementById('upcoming-body').innerHTML =
+      '<div class="no-upcoming">Failed to load upcoming games.</div>';
+  }
+}
+
 // ── Polling loop ───────────────────────────────────────────────────────────
 async function poll() {
   await loadStatus();
   await loadSignals();
+  if (currentTab === 'upcoming')  await loadUpcoming();
   if (currentTab === 'positions') await loadPositions();
   if (currentTab === 'orders')    await loadOrders();
   if (currentTab === 'log')       await loadLog();
