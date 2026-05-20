@@ -1240,9 +1240,9 @@ HTML = """<!DOCTYPE html>
     <div class="tbl-wrap">
       <table>
         <thead><tr>
-          <th>Player / Team</th><th>Sport</th><th>Src</th>
+          <th>Player / Team</th><th>Opponent</th><th>Sport</th><th>Src</th>
           <th>Ask</th><th>Model</th><th>Edge</th><th>Kelly $</th>
-          <th>Score / Book</th><th>Action</th>
+          <th>Live State</th><th>Action</th>
         </tr></thead>
         <tbody id="sig-body"></tbody>
       </table>
@@ -1583,21 +1583,29 @@ async function loadSignals() {
 
     const tbody = document.getElementById('sig-body');
     if (!sigs.length) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">No signals yet — start the scanner in Settings</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="10" class="empty">No signals yet — scanner is starting...</td></tr>';
       return;
     }
-    tbody.innerHTML = sigs.map(s => `
-      <tr>
+    tbody.innerHTML = sigs.map(s => {
+      const homeAwayBadge = s.home_away
+        ? `<span style="font-size:9px;padding:1px 4px;border-radius:2px;margin-left:4px;background:${s.home_away==='HOME'?'#1a3a1a':'#3a1a1a'};color:${s.home_away==='HOME'?'#00ff88':'#ff6b6b'}">${s.home_away}</span>`
+        : '';
+      const opponentCell = s.opponent
+        ? `<td style="font-size:12px">vs ${s.opponent}${homeAwayBadge}</td>`
+        : '<td class="dim">—</td>';
+      return `<tr>
         <td>${s.player || ''}</td>
+        ${opponentCell}
         <td class="dim">${s.sport || ''}</td>
         <td><span class="src ${s.source}">${s.source.toUpperCase()}</span></td>
         <td>${pctPlain(s.kalshi_ask)}</td>
         <td>${pctPlain(s.model_prob)}</td>
         <td class="${edgeCls(s.edge)}">${pct(s.edge)}</td>
         <td>$${(s.kelly_usd || 0).toFixed(2)}</td>
-        <td class="dim" style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis">${s.score_state || ''}</td>
+        <td class="dim" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis">${s.score_state || ''}</td>
         <td class="${s.direction === 'BUY' ? 'buy' : 'skip'}">${s.direction}</td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
   } catch(_) {}
 }
 

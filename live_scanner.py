@@ -36,6 +36,9 @@ class LiveSignal:
     edge:        float
     kelly_usd:   float
     score_state: str     # human-readable current score
+    opponent:    str = ""
+    home_away:   str = ""  # "HOME" | "AWAY" | "" (tennis)
+    event_ticker: str = ""
 
 
 # ── Live score feed (ESPN public API) ────────────────────────────────────────
@@ -297,6 +300,7 @@ def tennis_signal(km: dict, live_matches: list[dict], tour: str, bankroll_usd: f
         return None
 
     score_state = f"{sets_p1}-{sets_p2} sets, {games_p1}-{games_p2} games (srv: {'P1' if p1_serving else 'P2'})"
+    opponent = p2_name if p1_is_our_player else p1_name
     return LiveSignal(
         ticker=km["ticker"],
         player=player,
@@ -306,6 +310,9 @@ def tennis_signal(km: dict, live_matches: list[dict], tour: str, bankroll_usd: f
         edge=edge,
         kelly_usd=kelly_bet(model_prob, km["ask"], bankroll_usd) if edge > 0 else 0,
         score_state=score_state,
+        opponent=opponent,
+        home_away="",
+        event_ticker=km.get("event_ticker", ""),
     )
 
 
@@ -333,6 +340,8 @@ def baseball_signal(km: dict, live_games: list[dict], bankroll_usd: float) -> Li
 
     half = "Bot" if is_bottom else "Top"
     score_state = f"{half} {inning}, {score_away}-{score_home}"
+    away = game["away"]
+    opponent = away if player_is_home else home
     return LiveSignal(
         ticker=km["ticker"],
         player=player,
@@ -342,6 +351,9 @@ def baseball_signal(km: dict, live_games: list[dict], bankroll_usd: float) -> Li
         edge=edge,
         kelly_usd=kelly_bet(model_prob, km["ask"], bankroll_usd) if edge > 0 else 0,
         score_state=score_state,
+        opponent=opponent,
+        home_away="HOME" if player_is_home else "AWAY",
+        event_ticker=km.get("event_ticker", ""),
     )
 
 
@@ -396,9 +408,10 @@ def scan_live(client: KalshiClient) -> list[LiveSignal]:
             # fallback: last segment of ticker
             player = ticker.split("-")[-1]
         return {
-            "ticker": ticker,
-            "player": player,
-            "ask": ask,
+            "ticker":       ticker,
+            "player":       player,
+            "ask":          ask,
+            "event_ticker": m.get("event_ticker", ""),
         }
 
     signals: list[LiveSignal] = []
