@@ -35,8 +35,9 @@ except ImportError:
 
 KALSHI_API_KEY = config.KALSHI_API_KEY
 ODDS_API_KEY   = config.ODDS_API_KEY
-POSITIONS_FILE = Path("positions.jsonl")
-ORDERS_FILE    = Path("orders.jsonl")
+POSITIONS_FILE  = Path("positions.jsonl")
+ORDERS_FILE     = Path("orders.jsonl")
+EXITS_FILE      = Path("exits.jsonl")
 PERF_CACHE_FILE = Path("perf_cache.json")
 
 app = Flask(__name__)
@@ -87,6 +88,8 @@ _state: dict = {
         "kelly_fraction":    0.5,
         "arb_interval_sec":  300,
         "live_interval_sec": 30,
+        "stop_loss_pct":     0.35,
+        "profit_take_pct":   0.50,
     },
 }
 
@@ -124,8 +127,123 @@ def _sync_executor_config():
     executor.DRY_RUN        = _state["dry_run"]
     executor.MIN_EDGE       = cfg["min_edge"]
     executor.MAX_BET_USD    = cfg["max_bet_usd"]
+    executor.STOP_LOSS_PCT  = cfg["stop_loss_pct"]
+    executor.PROFIT_TAKE_PCT = cfg["profit_take_pct"]
     live_mod.MIN_EDGE       = cfg["min_edge"]
     live_mod.KELLY_FRACTION = cfg["kelly_fraction"]
+
+
+def _check_exits(client: KalshiClient):
+    """
+    Scan open positions (real in live mode, virtual from orders.jsonl in dry-run)
+    and trigger stop-loss or profit-take sells when thresholds are breached.
+    """
+    cfg             = _state["config"]
+    stop_loss_pct   = cfg["stop_loss_pct"]
+    profit_take_pct = cfg["profit_take_pct"]
+    dry_run         = _state["dry_run"]
+
+    # Real positions from Kalshi
+    real_positions: list[dict] = []
+    try:
+        real_positions = client.get_positions().get("market_positions", [])
+    except Exception as e:
+        _log(f"[EXIT] positions fetch failed: {e}")
+
+    # Virtual positions in dry-run: orders.jsonl entries not yet in exits.jsonl
+    virtual_positions: list[dict] = []
+    if dry_run and ORDERS_FILE.exists():
+        exited = set()
+        if EXITS_FILE.exists():
+            for line in EXITS_FILE.read_text(encoding="utf-8").splitlines():
+                try:
+                    exited.add(json.loads(line)["ticker"])
+                except Exception:
+                    pass
+        seen = set()
+        for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                o = json.loads(line)
+                t = o.get("ticker", "")
+                if (t and t not in seen and t not in exited
+                        and o.get("status") == "dry_run"
+                        and o.get("contracts", 0) > 0):
+                    seen.add(t)
+                    virtual_positions.append({
+                        "ticker":    t,
+                        "position":  o["contracts"],
+                        "side":      o.get("side", "yes"),
+                        "entry_cents": o.get("price_cents", 0),
+                        "_virtual":  True,
+                    })
+            except Exception:
+                pass
+
+    # Build entry-price map from orders.jsonl (first logged order per ticker)
+    entry_map: dict[str, dict] = {}
+    if ORDERS_FILE.exists():
+        for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                o = json.loads(line)
+                t = o.get("ticker", "")
+                if t and t not in entry_map and o.get("contracts", 0) > 0:
+                    entry_map[t] = {
+                        "entry_cents": o.get("price_cents", 0),
+                        "contracts":   o.get("contracts", 0),
+                        "side":        o.get("side", "yes"),
+                    }
+            except Exception:
+                pass
+
+    # Combine: real first, then virtual for tickers not already in real positions
+    real_tickers = {p.get("ticker") for p in real_positions}
+    to_check = list(real_positions) + [v for v in virtual_positions if v["ticker"] not in real_tickers]
+
+    for pos in to_check:
+        ticker   = pos.get("ticker", "")
+        net_pos  = pos.get("position", 0)
+        virtual  = pos.get("_virtual", False)
+
+        if net_pos <= 0:
+            continue
+
+        # Get entry price — virtual positions carry it directly; real ones come from entry_map
+        if virtual:
+            entry_cents = pos.get("entry_cents", 0)
+            side        = pos.get("side", "yes")
+        elif ticker in entry_map:
+            entry_cents = entry_map[ticker]["entry_cents"]
+            side        = entry_map[ticker]["side"]
+        else:
+            continue
+
+        if entry_cents <= 0:
+            continue
+
+        try:
+            market      = client.get_market(ticker)
+            bid_dollars = float(market.get("yes_bid_dollars") or 0)
+            bid_cents   = round(bid_dollars * 100)
+        except Exception as e:
+            _log(f"[EXIT] market fetch failed {ticker}: {e}")
+            continue
+
+        if bid_cents <= 0:
+            continue
+
+        entry_dollars = entry_cents / 100
+        drop = (entry_dollars - bid_dollars) / entry_dollars
+        rise = (bid_dollars - entry_dollars) / entry_dollars
+        tag  = "[DRY] " if virtual else ""
+
+        if drop >= stop_loss_pct:
+            _log(f"[EXIT] {tag}STOP-LOSS {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ drop={drop:.1%}")
+            r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "stop_loss")
+            _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
+        elif rise >= profit_take_pct:
+            _log(f"[EXIT] {tag}PROFIT-TAKE {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ rise={rise:.1%}")
+            r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "profit_take")
+            _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
 
 
 def _scanner_loop():
@@ -177,6 +295,12 @@ def _scanner_loop():
             _log(f"Live scan done — {len(live)} live signals")
         except Exception as e:
             _log(f"Live scan error: {e}")
+
+        # Exit check — runs every cycle after live scan
+        try:
+            _check_exits(_client)
+        except Exception as e:
+            _log(f"[EXIT] check error: {e}")
 
         _stop_event.wait(cfg["live_interval_sec"])
 
@@ -279,6 +403,8 @@ _CONFIG_BOUNDS = {
     "kelly_fraction":    (0.05, 1.0),
     "arb_interval_sec":  (300,  86400),
     "live_interval_sec": (10,   300),
+    "stop_loss_pct":     (0.10, 0.60),
+    "profit_take_pct":   (0.20, 0.90),
 }
 
 @app.route("/api/config", methods=["POST"])
@@ -963,6 +1089,28 @@ HTML = """<!DOCTYPE html>
       <p style="font-size:10px;color:#555;margin-bottom:12px">
         Free Odds API tier: 500 req/mo. At 8 req/scan: 1h=5,760/mo, 6h=960/mo, 24h=240/mo.
       </p>
+    </div>
+
+    <div class="setting-group">
+      <h3>Exit Rules</h3>
+      <div class="cfg-row">
+        <label>Stop-Loss</label>
+        <input type="range" id="rng-stop-loss" min="10" max="60" step="5"
+               oninput="showVal('stop-loss', this.value+'%')">
+        <span class="cfg-val" id="val-stop-loss">35%</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:8px">
+        Sell if current bid drops X% below your entry price.
+      </p>
+      <div class="cfg-row">
+        <label>Profit-Take</label>
+        <input type="range" id="rng-profit-take" min="20" max="90" step="5"
+               oninput="showVal('profit-take', this.value+'%')">
+        <span class="cfg-val" id="val-profit-take">50%</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:12px">
+        Sell if current bid rises X% above your entry price.
+      </p>
       <button class="btn btn-gray" onclick="saveConfig()" style="margin-top:6px">Save Config</button>
     </div>
 
@@ -1026,6 +1174,10 @@ function syncSliders(cfg) {
   setValue('kelly',    Math.round(cfg.kelly_fraction * 100),
            cfg.kelly_fraction.toFixed(2));
   setValue('live-int', cfg.live_interval_sec, cfg.live_interval_sec + 's');
+  setValue('stop-loss',    Math.round((cfg.stop_loss_pct   || 0.35) * 100),
+           Math.round((cfg.stop_loss_pct   || 0.35) * 100) + '%');
+  setValue('profit-take',  Math.round((cfg.profit_take_pct || 0.50) * 100),
+           Math.round((cfg.profit_take_pct || 0.50) * 100) + '%');
   const arbH = Math.max(1, Math.round(cfg.arb_interval_sec / 3600));
   setValue('arb-int', arbH, arbH + 'h');
 }
@@ -1163,6 +1315,8 @@ async function saveConfig() {
     kelly_fraction:    parseFloat(document.getElementById('rng-kelly').value) / 100,
     live_interval_sec: parseFloat(document.getElementById('rng-live-int').value),
     arb_interval_sec:  parseFloat(document.getElementById('rng-arb-int').value) * 3600,
+    stop_loss_pct:     parseFloat(document.getElementById('rng-stop-loss').value) / 100,
+    profit_take_pct:   parseFloat(document.getElementById('rng-profit-take').value) / 100,
   };
   const r = await fetch('/api/config', {
     method: 'POST',

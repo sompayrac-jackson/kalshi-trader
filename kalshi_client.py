@@ -121,5 +121,28 @@ class KalshiClient:
         }
         return self._post("/portfolio/orders", body)
 
+    def sell_order(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        yes_price: int,
+        client_order_id: str = None,
+    ) -> dict:
+        """
+        Place a limit sell order to exit an open position.
+        yes_price : the YES bid price in cents (1–99) — set to current bid to get filled quickly.
+        """
+        body = {
+            "ticker": ticker,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "type": "limit",
+            "action": "sell",
+            "side": side,
+            "count": count,
+            "yes_price": yes_price,
+        }
+        return self._post("/portfolio/orders", body)
+
     def cancel_order(self, order_id: str) -> dict:
         return self._delete(f"/portfolio/orders/{order_id}")

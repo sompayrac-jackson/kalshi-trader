@@ -25,7 +25,11 @@ MAX_BET_USD = 25.0    # hard cap per order regardless of Kelly
 MIN_BET_USD = 1.0     # ignore signals below this size
 MIN_EDGE    = 0.03    # skip signals below this edge even if passed in
 
-LOG_FILE = Path("orders.jsonl")
+STOP_LOSS_PCT   = 0.35   # sell if bid drops this fraction below entry price
+PROFIT_TAKE_PCT = 0.50   # sell if bid rises this fraction above entry price
+
+LOG_FILE      = Path("orders.jsonl")
+EXIT_LOG_FILE = Path("exits.jsonl")
 
 
 # ── Order result ──────────────────────────────────────────────────────────────
@@ -45,6 +49,22 @@ class OrderResult:
     order_id:     str = ""
     status:       str = ""
     error:        str = ""
+
+
+@dataclass
+class ExitResult:
+    ts:          str
+    ticker:      str
+    side:        str
+    contracts:   int
+    entry_cents: int
+    exit_cents:  int
+    pnl_usd:     float
+    reason:      str   # 'stop_loss' or 'profit_take'
+    dry_run:     bool
+    order_id:    str = ""
+    status:      str = ""
+    error:       str = ""
 
 
 # ── Core executor ─────────────────────────────────────────────────────────────
@@ -205,6 +225,54 @@ def execute_live(client: KalshiClient, signal: LiveSignal) -> OrderResult:
     )
 
 
+# ── Exit executor ─────────────────────────────────────────────────────────────
+
+def execute_exit(
+    client: KalshiClient,
+    ticker: str,
+    side: str,
+    contracts: int,
+    entry_cents: int,
+    bid_cents: int,
+    reason: str,
+) -> ExitResult:
+    """
+    Sell an open position at the current bid price.
+    reason : 'stop_loss' or 'profit_take'
+    """
+    ts      = datetime.now(timezone.utc).isoformat()
+    pnl_usd = (bid_cents - entry_cents) * contracts / 100
+
+    result = ExitResult(
+        ts=ts, ticker=ticker, side=side, contracts=contracts,
+        entry_cents=entry_cents, exit_cents=bid_cents,
+        pnl_usd=pnl_usd, reason=reason, dry_run=DRY_RUN,
+    )
+
+    if DRY_RUN:
+        result.status   = "dry_run"
+        result.order_id = f"dry-exit-{uuid.uuid4().hex[:8]}"
+        _log_exit(result)
+        return result
+
+    try:
+        resp = client.sell_order(
+            ticker=ticker,
+            side=side,
+            count=contracts,
+            yes_price=bid_cents,
+        )
+        result.order_id = resp.get("order", {}).get("order_id", "")
+        result.status   = resp.get("order", {}).get("status", "submitted")
+        _log_exit(result)
+    except Exception as e:
+        result.status = "error"
+        result.error  = str(e)
+        _log_exit(result)
+
+    return result
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _skip(ts, ticker, player, side, ask, kelly, edge, source, reason) -> OrderResult:
@@ -229,4 +297,9 @@ def _print(r: OrderResult):
 
 def _log(r: OrderResult):
     with LOG_FILE.open("a") as f:
+        f.write(json.dumps(asdict(r)) + "\n")
+
+
+def _log_exit(r: ExitResult):
+    with EXIT_LOG_FILE.open("a") as f:
         f.write(json.dumps(asdict(r)) + "\n")
