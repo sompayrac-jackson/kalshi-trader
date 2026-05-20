@@ -283,13 +283,7 @@ def api_config():
     return jsonify({"ok": True, "config": _state["config"]})
 
 
-# ── Upcoming games ────────────────────────────────────────────────────────────
-
-_upcoming_cache: dict = {"data": [], "ts": 0.0}
-_upcoming_lock  = threading.Lock()
-UPCOMING_TTL    = 120   # seconds before refreshing from Kalshi
-UPCOMING_WINDOW = 48    # hours ahead to show
-
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _get_client() -> KalshiClient:
     """Return the running scanner client, or create a temporary one."""
@@ -298,78 +292,184 @@ def _get_client() -> KalshiClient:
     return KalshiClient(api_key_id=KALSHI_API_KEY)
 
 
-def _fetch_upcoming() -> list[dict]:
-    """
-    Fetch Kalshi markets starting in the next UPCOMING_WINDOW hours.
-    Groups both sides of the same match by event_ticker.
-    """
-    now   = datetime.now(timezone.utc)
-    cutoff_iso = now.isoformat()
-    client = _get_client()
+def _parse_player(m: dict) -> str:
+    import re
+    title = m.get("title", "")
+    tm    = re.match(r"Will (.+?) win", title)
+    sub   = (m.get("yes_sub_title") or m.get("no_sub_title") or "").strip()
+    if tm:  return tm.group(1)
+    if sub: return sub
+    return m.get("ticker", "").split("-")[-1]
 
-    raw_markets: list[dict] = []
+
+def _fetch_kalshi_markets(series: str, now: datetime) -> list[dict]:
+    """Fetch open Kalshi markets for a series, tagged with sport and timing."""
+    sport = "baseball" if series == "KXMLBGAME" else "tennis"
+    try:
+        resp = _get_client()._get("/markets", params={
+            "limit": 200, "series_ticker": series, "status": "open"
+        })
+    except Exception as e:
+        _log(f"[games] {series} fetch error: {e}")
+        return []
+    out = []
+    for m in resp.get("markets", []):
+        odt = m.get("occurrence_datetime", "")
+        if not odt or m.get("result") or not m.get("yes_ask_dollars"):
+            continue
+        dt = datetime.fromisoformat(odt.replace("Z", "+00:00"))
+        m["_sport"] = sport
+        m["_dt"]    = dt
+        m["_live"]  = dt <= now
+        out.append(m)
+    return out
+
+
+# ── Live games ─────────────────────────────────────────────────────────────────
+
+_live_now_cache: dict = {"data": [], "ts": 0.0}
+_live_now_lock  = threading.Lock()
+LIVE_NOW_TTL    = 30  # seconds
+
+
+def _build_live_games() -> list[dict]:
+    from live_scanner import (fetch_espn_tennis, fetch_espn_baseball,
+                               find_live_match, find_baseball_game, parse_inning)
+    now    = datetime.now(timezone.utc)
+    cards: list[dict] = []
+
+    # Kalshi live markets — occurrence_datetime < now, no result
+    raw: list[dict] = []
     for series in ("KXATPMATCH", "KXWTAMATCH", "KXMLBGAME"):
-        sport = "baseball" if series == "KXMLBGAME" else "tennis"
-        try:
-            resp = client._get("/markets", params={
-                "limit": 200, "series_ticker": series, "status": "open"
-            })
-            for m in resp.get("markets", []):
-                odt = m.get("occurrence_datetime", "")
-                if not odt:
-                    continue
-                dt = datetime.fromisoformat(odt.replace("Z", "+00:00"))
-                hours_until = (dt - now).total_seconds() / 3600
-                # Only pre-match games in the next UPCOMING_WINDOW hours
-                if not (0 < hours_until <= UPCOMING_WINDOW):
-                    continue
-                if m.get("result"):
-                    continue
-                m["_sport"]       = sport
-                m["_hours_until"] = hours_until
-                m["_dt"]          = dt
-                raw_markets.append(m)
-        except Exception as e:
-            _log(f"[upcoming] {series} fetch error: {e}")
+        for m in _fetch_kalshi_markets(series, now):
+            if m["_live"]:
+                raw.append(m)
 
-    # Group by event_ticker — each event has two markets (one per side)
-    events: dict[str, list[dict]] = {}
-    for m in raw_markets:
+    if not raw:
+        return []
+
+    # ESPN live scores
+    try:
+        live_tennis   = fetch_espn_tennis()
+        live_baseball = fetch_espn_baseball()
+    except Exception as e:
+        _log(f"[live_now] ESPN error: {e}")
+        return []
+
+    # Snapshot of trading signals for edge overlay
+    with _lock:
+        sig_by_ticker = {s["ticker"]: s for s in _state["signals"]}
+
+    # Group Kalshi markets by event_ticker
+    events: dict[str, list] = {}
+    for m in raw:
+        key = m.get("event_ticker") or m.get("ticker", "")
+        events.setdefault(key, []).append(m)
+
+    for event_key, sides in events.items():
+        sport = sides[0]["_sport"]
+
+        parsed_sides = []
+        for m in sides:
+            player = _parse_player(m)
+            sig    = sig_by_ticker.get(m.get("ticker", ""), {})
+            parsed_sides.append({
+                "ticker":     m.get("ticker", ""),
+                "player":     player,
+                "ask":        round(float(m["yes_ask_dollars"]), 2),
+                "model_prob": sig.get("model_prob"),
+                "edge":       sig.get("edge"),
+                "direction":  sig.get("direction"),
+            })
+
+        # Match ESPN score
+        score_state = None
+        if sport == "tennis" and parsed_sides:
+            espn = None
+            for s in parsed_sides:
+                espn = find_live_match(s["player"], live_tennis, "p1", "p2")
+                if espn:
+                    break
+            if espn:
+                score_state = (f"{espn['sets_p1']}-{espn['sets_p2']} sets  "
+                               f"{espn['games_p1']}-{espn['games_p2']} games  "
+                               f"({'P1' if espn['p1_serving'] else 'P2'} srv)")
+        elif sport == "baseball" and parsed_sides:
+            espn = find_baseball_game(parsed_sides[0]["player"], live_baseball)
+            if espn:
+                inning, is_bot = parse_inning(espn.get("inning_str", ""))
+                score_state = (f"{'Bot' if is_bot else 'Top'} {inning}  "
+                               f"{espn['score_away']}-{espn['score_home']}")
+
+        # Only include if we have an ESPN score (confirms it's truly in-play)
+        if score_state:
+            cards.append({
+                "event_ticker": event_key,
+                "sport":        sport,
+                "score_state":  score_state,
+                "sides":        parsed_sides,
+            })
+
+    return cards
+
+
+@app.route("/api/live_now")
+@_require_auth
+def api_live_now():
+    with _live_now_lock:
+        if time.time() - _live_now_cache["ts"] < LIVE_NOW_TTL:
+            return jsonify(_live_now_cache["data"])
+    try:
+        data = _build_live_games()
+    except Exception as e:
+        _log(f"[live_now] build error: {e}")
+        return jsonify([])
+    with _live_now_lock:
+        _live_now_cache["data"] = data
+        _live_now_cache["ts"]   = time.time()
+    return jsonify(data)
+
+
+# ── Upcoming games ─────────────────────────────────────────────────────────────
+
+_upcoming_cache: dict = {"data": [], "ts": 0.0}
+_upcoming_lock  = threading.Lock()
+UPCOMING_TTL    = 120   # seconds before refreshing from Kalshi
+UPCOMING_WINDOW = 48    # hours ahead to show
+
+
+def _fetch_upcoming() -> list[dict]:
+    """Fetch Kalshi markets starting in the next UPCOMING_WINDOW hours."""
+    now = datetime.now(timezone.utc)
+    raw: list[dict] = []
+    for series in ("KXATPMATCH", "KXWTAMATCH", "KXMLBGAME"):
+        for m in _fetch_kalshi_markets(series, now):
+            hours_until = (m["_dt"] - now).total_seconds() / 3600
+            if 0 < hours_until <= UPCOMING_WINDOW:
+                m["_hours_until"] = hours_until
+                raw.append(m)
+
+    events: dict[str, list] = {}
+    for m in raw:
         key = m.get("event_ticker") or m.get("ticker", "")
         events.setdefault(key, []).append(m)
 
     result: list[dict] = []
     for event_key, sides in events.items():
-        # Pick the earliest occurrence_datetime as the event time
         sides.sort(key=lambda m: m["_dt"])
-        first     = sides[0]
-        dt        = first["_dt"]
+        first      = sides[0]
+        dt         = first["_dt"]
         mins_until = int((dt - now).total_seconds() / 60)
-
-        # Build per-side entries
         parsed_sides = []
         for m in sides:
-            title = m.get("title", "")
-            # Tennis title: "Will X win ..."
-            import re
-            tennis_match = re.match(r"Will (.+?) win", title)
-            sub = (m.get("yes_sub_title") or m.get("no_sub_title") or "").strip()
-            if tennis_match:
-                player = tennis_match.group(1)
-            elif sub:
-                player = sub
-            else:
-                player = title or m.get("ticker", "").split("-")[-1]
-
             ask = m.get("yes_ask_dollars")
             bid = m.get("yes_bid_dollars")
             parsed_sides.append({
                 "ticker": m.get("ticker", ""),
-                "player": player,
+                "player": _parse_player(m),
                 "ask":    round(float(ask), 2) if ask else None,
                 "bid":    round(float(bid), 2) if bid else None,
             })
-
         result.append({
             "event_ticker": event_key,
             "sport":        first["_sport"],
@@ -503,6 +603,28 @@ HTML = """<!DOCTYPE html>
   .st.submitted,.st.resting{color:#00ff88}
   .st.skipped,.st.error{color:#ff6b6b}
 
+  /* Section headers */
+  .section-hdr{font-size:11px;color:#00ff88;text-transform:uppercase;letter-spacing:.1em;padding-bottom:10px;border-bottom:1px solid #1a3a1a;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  .section-count{color:#444;font-size:10px}
+  .live-dot{width:8px;height:8px;border-radius:50%;background:#ff4444;animation:pulse 1.2s infinite;flex-shrink:0}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,68,68,.6)}50%{box-shadow:0 0 0 5px rgba(255,68,68,0)}}
+
+  /* Live game cards */
+  .live-card{background:#0f1a0f;border:1px solid #1a3a1a;border-left:3px solid #00ff88;border-radius:5px;padding:14px 16px;margin-bottom:8px}
+  .live-card-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+  .live-badge{font-size:9px;background:#ff4444;color:#fff;padding:2px 7px;border-radius:3px;letter-spacing:.08em;animation:pulse 1.2s infinite}
+  .live-sport{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.06em}
+  .live-score{margin-left:auto;font-size:11px;color:#00ff88;background:#001a0d;padding:3px 10px;border-radius:3px;font-family:'Courier New',monospace}
+  .live-teams{display:flex;align-items:stretch;gap:0}
+  .live-side{flex:1;padding:8px 12px;background:#0a0a0a;border-radius:4px}
+  .live-side.right{text-align:right}
+  .live-side-name{font-size:13px;color:#ddd;margin-bottom:4px}
+  .live-side-ask{font-size:11px;color:#555}
+  .live-side-ask span{color:#aaa}
+  .live-side-model{font-size:11px;margin-top:2px}
+  .live-side-edge{font-size:11px;font-weight:bold;margin-top:2px}
+  .live-vs{display:flex;align-items:center;padding:0 12px;color:#222;font-size:12px;flex-shrink:0}
+
   /* Upcoming fixtures */
   .fixture-group{margin-bottom:10px}
   .fixture-group-header{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.08em;padding:6px 0 4px;border-bottom:1px solid #1e1e1e;margin-bottom:4px}
@@ -538,7 +660,7 @@ HTML = """<!DOCTYPE html>
 
 <div class="tabs">
   <div class="tab active" onclick="showTab('signals')">Signals</div>
-  <div class="tab" onclick="showTab('upcoming')">Upcoming</div>
+  <div class="tab" onclick="showTab('upcoming')">Games</div>
   <div class="tab" onclick="showTab('positions')">Positions</div>
   <div class="tab" onclick="showTab('orders')">Orders</div>
   <div class="tab" onclick="showTab('log')">Log</div>
@@ -568,15 +690,30 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- UPCOMING -->
+  <!-- UPCOMING / GAMES -->
   <div class="panel" id="panel-upcoming">
-    <div class="stats">
-      <div class="card"><div class="lbl">Events (48h)</div><div class="val" id="u-count">-</div></div>
-      <div class="card"><div class="lbl">Starting Soon (&lt;2h)</div><div class="val yellow" id="u-soon">-</div></div>
-      <div class="card"><div class="lbl">Tennis</div><div class="val" id="u-tennis">-</div></div>
-      <div class="card"><div class="lbl">Baseball</div><div class="val" id="u-baseball">-</div></div>
+    <!-- Live now section -->
+    <div id="live-now-section">
+      <div class="section-hdr">
+        <span class="live-dot"></span> LIVE NOW
+        <span id="live-count" class="section-count"></span>
+      </div>
+      <div id="live-now-body"><div class="no-upcoming dim" style="padding:16px 0">Checking for live games...</div></div>
     </div>
-    <div id="upcoming-body"></div>
+
+    <!-- Upcoming section -->
+    <div style="margin-top:24px">
+      <div class="section-hdr" style="border-color:#2a2a2a;color:#444">
+        UPCOMING &mdash; NEXT 48H
+        <span id="u-count" class="section-count"></span>
+      </div>
+      <div class="stats" style="margin-top:12px">
+        <div class="card"><div class="lbl">Starting Soon (&lt;2h)</div><div class="val yellow" id="u-soon">-</div></div>
+        <div class="card"><div class="lbl">Tennis</div><div class="val" id="u-tennis">-</div></div>
+        <div class="card"><div class="lbl">Baseball</div><div class="val" id="u-baseball">-</div></div>
+      </div>
+      <div id="upcoming-body"></div>
+    </div>
   </div>
 
   <!-- POSITIONS -->
@@ -670,7 +807,7 @@ function showTab(name) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.getElementById('panel-' + name).classList.add('active');
   currentTab = name;
-  if (name === 'upcoming')  loadUpcoming();
+  if (name === 'upcoming')  { loadLiveNow(); loadUpcoming(); }
   if (name === 'positions') loadPositions();
   if (name === 'orders')    loadOrders();
   if (name === 'log')       loadLog();
@@ -858,6 +995,58 @@ async function saveConfig() {
   loadStatus();
 }
 
+// ── Live now ───────────────────────────────────────────────────────────────
+async function loadLiveNow() {
+  try {
+    const games = await fetch('/api/live_now').then(r => r.json());
+    const ct = document.getElementById('live-count');
+    if (ct) ct.textContent = games.length ? `(${games.length})` : '';
+
+    const body = document.getElementById('live-now-body');
+    if (!games.length) {
+      body.innerHTML = '<div class="no-upcoming dim" style="padding:14px 0;font-size:12px">No live games right now.</div>';
+      return;
+    }
+
+    body.innerHTML = games.map(g => {
+      const icon  = g.sport === 'tennis' ? '&#127934;' : '&#9918;';
+      const sideA = g.sides[0] || {};
+      const sideB = g.sides[1] || {};
+
+      function sideHtml(s, align) {
+        const priceStr  = s.ask != null ? Math.round(s.ask * 100) + 'c' : '-';
+        const modelStr  = s.model_prob != null ? Math.round(s.model_prob * 100) + '%' : '';
+        const edgeVal   = s.edge;
+        const edgeStr   = edgeVal != null ? (edgeVal >= 0 ? '+' : '') + Math.round(edgeVal * 100) + '%' : '';
+        const edgeCls   = edgeVal != null ? (edgeVal > 0 ? 'green' : 'red') : 'dim';
+        const dirStr    = s.direction === 'BUY' ? ' BUY' : '';
+        return `<div class="live-side ${align === 'right' ? 'right' : ''}">
+          <div class="live-side-name">${s.player || '—'}</div>
+          <div class="live-side-ask">ask <span>${priceStr}</span></div>
+          ${modelStr ? `<div class="live-side-model dim">model <span style="color:#aaa">${modelStr}</span></div>` : ''}
+          ${edgeStr ? `<div class="live-side-edge ${edgeCls}">${edgeStr}${dirStr}</div>` : ''}
+        </div>`;
+      }
+
+      return `<div class="live-card">
+        <div class="live-card-header">
+          <span class="live-badge">LIVE</span>
+          <span class="live-sport">${icon} ${g.sport}</span>
+          <span class="live-score">${g.score_state}</span>
+        </div>
+        <div class="live-teams">
+          ${sideHtml(sideA, 'left')}
+          <div class="live-vs">vs</div>
+          ${sideHtml(sideB, 'right')}
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('live-now-body').innerHTML =
+      '<div class="no-upcoming dim" style="padding:14px 0">Failed to load live games.</div>';
+  }
+}
+
 // ── Upcoming games ─────────────────────────────────────────────────────────
 function fmtCountdown(mins) {
   if (mins <= 0)   return 'NOW';
@@ -952,7 +1141,7 @@ async function loadUpcoming() {
 async function poll() {
   await loadStatus();
   await loadSignals();
-  if (currentTab === 'upcoming')  await loadUpcoming();
+  if (currentTab === 'upcoming')  { await loadLiveNow(); await loadUpcoming(); }
   if (currentTab === 'positions') await loadPositions();
   if (currentTab === 'orders')    await loadOrders();
   if (currentTab === 'log')       await loadLog();
