@@ -23,6 +23,7 @@ from flask import Flask, jsonify, render_template_string, request, Response
 
 import config
 from kalshi_client import KalshiClient
+import live_scanner as live_mod
 from live_scanner import scan_live
 import order_executor as executor
 
@@ -117,6 +118,16 @@ def _to_dict(sig, source: str) -> dict:
     return d
 
 
+def _sync_executor_config():
+    """Push dashboard config sliders into scanner and executor module globals."""
+    cfg = _state["config"]
+    executor.DRY_RUN        = _state["dry_run"]
+    executor.MIN_EDGE       = cfg["min_edge"]
+    executor.MAX_BET_USD    = cfg["max_bet_usd"]
+    live_mod.MIN_EDGE       = cfg["min_edge"]
+    live_mod.KELLY_FRACTION = cfg["kelly_fraction"]
+
+
 def _scanner_loop():
     global _client
     _client  = KalshiClient(api_key_id=KALSHI_API_KEY)
@@ -126,13 +137,21 @@ def _scanner_loop():
         cfg = _state["config"]
         now = time.time()
         signals: list[dict] = []
+        _sync_executor_config()
 
         # Arb scan (throttled)
         if HAS_ARB and ODDS_API_KEY and (now - last_arb >= cfg["arb_interval_sec"]):
             try:
                 _log("Running arb scan...")
-                for s in arb_scan(_client, ODDS_API_KEY):
+                arb_signals = list(arb_scan(_client, ODDS_API_KEY))
+                for s in arb_signals:
                     signals.append(_to_dict(s, "arb"))
+                    if s.edge > 0:
+                        try:
+                            r = executor.execute_arb(_client, s)
+                            _log(f"[ARB] {r.player} — {r.status} {r.error or ''}")
+                        except Exception as e:
+                            _log(f"[ARB] execute error: {e}")
                 last_arb = now
                 with _lock:
                     _state["last_arb_scan"] = datetime.now(timezone.utc).isoformat()
@@ -146,6 +165,12 @@ def _scanner_loop():
             live = scan_live(_client)
             for s in live:
                 signals.append(_to_dict(s, "live"))
+                if s.edge > 0:
+                    try:
+                        r = executor.execute_live(_client, s)
+                        _log(f"[LIVE] {r.player} — {r.status} {r.error or ''}")
+                    except Exception as e:
+                        _log(f"[LIVE] execute error: {e}")
             with _lock:
                 _state["signals"]        = signals
                 _state["last_live_scan"] = datetime.now(timezone.utc).isoformat()
