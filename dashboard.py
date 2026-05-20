@@ -387,9 +387,8 @@ def api_signals():
 @_require_auth
 def api_positions():
     try:
-        if _client is None:
-            return jsonify([])
-        raw = _client.get_positions().get("market_positions", [])
+        c = _client or KalshiClient(api_key_id=KALSHI_API_KEY)
+        raw = c.get_positions().get("market_positions", [])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
