@@ -391,6 +391,7 @@ def api_positions():
         resp = c.get_positions()
         raw_markets = resp.get("market_positions", [])
         raw_events  = resp.get("event_positions", [])
+        balance_usd = c.get_balance().get("balance", 0) / 100
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -464,7 +465,7 @@ def api_positions():
         for e in raw_events
     ]
 
-    return jsonify({"positions": positions, "events": events})
+    return jsonify({"positions": positions, "events": events, "balance_usd": balance_usd})
 
 
 @app.route("/api/orders")
@@ -1282,6 +1283,7 @@ HTML = """<!DOCTYPE html>
       <div class="card"><div class="lbl">Total Contracts</div><div class="val" id="p-contracts">-</div></div>
       <div class="card"><div class="lbl">Fees Paid</div><div class="val red" id="p-fees">-</div></div>
       <div class="card"><div class="lbl">Unrealized P&amp;L</div><div class="val" id="p-unrealized">-</div></div>
+      <div class="card"><div class="lbl">Cash Available</div><div class="val green" id="p-cash">-</div></div>
     </div>
 
     <div style="margin:18px 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.08em">Exposure by Event</div>
@@ -1604,7 +1606,7 @@ function parseEventLabel(et) {
   // KXMLBGAME-26MAY201905TORNYY → "TOR vs NYY — May 20"
   const m = et.match(/-(\d{2})([A-Z]{3})(\d{2})\d{4}([A-Z]+)$/);
   if (!m) return et;
-  const [, day, mon, , teams] = m;
+  const [, , mon, day, teams] = m;  // format: YY MON DD time TEAMS
   const tl = teams.length;
   let t1, t2;
   if      (tl >= 6) { t1 = teams.slice(0,3); t2 = teams.slice(3); }
@@ -1617,8 +1619,9 @@ async function loadPositions() {
   try {
     const data = await fetch('/api/positions').then(r => r.json());
     if (data.error) { console.error(data.error); return; }
-    const ps     = data.positions || [];
-    const events = data.events    || [];
+    const ps     = data.positions  || [];
+    const events = data.events     || [];
+    const cash   = data.balance_usd ?? null;
 
     // ── Summary stats ──────────────────────────────────────────────────────
     const totalInvested   = ps.reduce((s, p) => s + (p.cost_usd  || 0), 0);
@@ -1639,24 +1642,45 @@ async function loadPositions() {
       unrealEl.textContent = '—';
       unrealEl.className   = 'val dim';
     }
+    const cashEl = document.getElementById('p-cash');
+    cashEl.textContent = cash != null ? '$' + cash.toFixed(2) : '—';
 
     // ── Event exposure bars ────────────────────────────────────────────────
+    // Build unrealized P&L per event from position data
+    const eventPnl = {};
+    ps.forEach(p => {
+      const evKey = p.ticker.split('-').slice(0, -1).join('-');
+      if (p.unrealized_pnl != null) {
+        eventPnl[evKey] = (eventPnl[evKey] || 0) + p.unrealized_pnl;
+      }
+    });
+
     const barsEl  = document.getElementById('p-event-bars');
     const maxCost = events.reduce((m, e) => Math.max(m, e.cost_usd), 0) || 1;
     barsEl.innerHTML = events.map(e => {
-      const pct  = (e.cost_usd / maxCost * 100).toFixed(1);
-      const pctT = (e.cost_usd / (totalInvested || 1) * 100).toFixed(0);
-      const lbl  = parseEventLabel(e.event_ticker);
+      const pct    = (e.cost_usd / maxCost * 100).toFixed(1);
+      const pctT   = (e.cost_usd / (totalInvested || 1) * 100).toFixed(0);
+      const lbl    = parseEventLabel(e.event_ticker);
+      const pnl    = eventPnl[e.event_ticker] ?? null;
+      const pnlStr = pnl != null
+        ? `<span class="${pnl >= 0 ? 'green' : 'red'}" style="font-size:11px;margin-left:8px">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</span>`
+        : '';
+      // P&L bar: width relative to cost, green if gain, red if loss
+      const pnlBarPct = pnl != null ? Math.min(Math.abs(pnl) / e.cost_usd * 100, 100).toFixed(1) : 0;
+      const pnlBarColor = pnl != null && pnl >= 0 ? '#00ff88' : '#ff6b6b';
       return `
-        <div style="margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+        <div style="margin-bottom:14px">
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-bottom:3px">
             <span>${lbl}</span>
-            <span class="yellow">$${e.cost_usd.toFixed(2)}</span>
+            <span><span class="yellow">$${e.cost_usd.toFixed(2)}</span>${pnlStr}</span>
           </div>
-          <div style="background:#1a1a2e;border-radius:3px;height:8px;overflow:hidden">
+          <div style="background:#1a1a2e;border-radius:3px;height:8px;overflow:hidden;margin-bottom:2px">
             <div style="width:${pct}%;height:100%;background:linear-gradient(90deg,#4ea8de,#6c63ff);border-radius:3px"></div>
           </div>
-          <div style="font-size:10px;color:#555;margin-top:2px">${e.contracts} contracts · ${pctT}% of portfolio</div>
+          <div style="background:#111;border-radius:3px;height:5px;overflow:hidden;margin-bottom:3px">
+            <div style="width:${pnlBarPct}%;height:100%;background:${pnlBarColor};border-radius:3px;transition:width .4s"></div>
+          </div>
+          <div style="font-size:10px;color:#555">${e.contracts} contracts · ${pctT}% of portfolio</div>
         </div>`;
     }).join('');
 
