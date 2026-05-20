@@ -1216,7 +1216,7 @@ HTML = """<!DOCTYPE html>
           <th>Entry</th><th>Cost</th><th>Edge</th>
           <th title="Current yes_bid from last scan">Current</th>
           <th title="Stop-loss ↓ / Profit-take ↑ trigger prices">SL↓ / PT↑</th>
-          <th>Status</th><th>Src</th><th></th>
+          <th>Status</th><th>Src</th><th title="ESPN link">ESPN</th><th></th>
         </tr></thead>
         <tbody id="ord-body"></tbody>
       </table>
@@ -1534,12 +1534,30 @@ function switchOrders(mode) {
   });
   loadOrders();
 }
+function espnUrl(ticker, player) {
+  ticker = (ticker || '').toUpperCase();
+  player = (player || '').trim();
+  let href, label;
+  if (ticker.includes('ATP') || ticker.includes('WTA')) {
+    href  = 'https://www.espn.com/tennis/results';
+    label = 'Tennis';
+  } else if (ticker.includes('MLB')) {
+    href  = 'https://www.espn.com/mlb/scoreboard';
+    label = 'MLB';
+  } else {
+    return '<td class="dim">—</td>';
+  }
+  return `<td><a href="${href}" target="_blank" rel="noopener"
+    style="font-size:11px;color:#4ea8de;text-decoration:none" title="ESPN ${label}"
+    >↗ ${label}</a></td>`;
+}
+
 async function loadOrders() {
   try {
     const os = await fetch('/api/orders?mode=' + ordersMode).then(r => r.json());
     const tbody = document.getElementById('ord-body');
     if (!os.length) {
-      tbody.innerHTML = '<tr><td colspan="12" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="13" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
       return;
     }
     tbody.innerHTML = os.map(o => {
@@ -1562,6 +1580,9 @@ async function loadOrders() {
         ? `<td style="font-size:11px"><span style="color:#ff6b6b">SL:${sl}¢</span> / <span style="color:#00ff88">PT:${pt}¢</span></td>`
         : '<td class="dim">—</td>';
 
+      // ESPN link
+      const espnCell = espnUrl(o.ticker, o.player);
+
       // Sell button — only for open positions
       const sellBtn = isOpen
         ? `<td><button class="btn btn-red" style="padding:2px 8px;font-size:11px"
@@ -1580,6 +1601,7 @@ async function loadOrders() {
         ${targCell}
         <td><span class="st ${o.status}">${o.status}</span></td>
         <td><span class="src ${o.source}">${o.source}</span></td>
+        ${espnCell}
         ${sellBtn}
       </tr>`;
     }).join('');
