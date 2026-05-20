@@ -433,6 +433,7 @@ def api_positions():
                     order_meta[t] = {
                         "player":      o.get("player", ""),
                         "price_cents": o.get("price_cents", 0),
+                        "edge":        o.get("edge", 0.0),
                         "opened_at":   o.get("ts", ""),
                         "source":      o.get("source", "live"),
                     }
@@ -441,6 +442,8 @@ def api_positions():
 
     with _price_lock:
         prices = dict(_price_cache)
+
+    sig_lookup = {s["ticker"]: s for s in _state.get("signals", [])}
 
     cfg     = _state["config"]
     sl_base = cfg.get("stop_loss_pct", 0.35)
@@ -457,6 +460,14 @@ def api_positions():
             continue
         meta        = order_meta.get(ticker, {})
         entry_cents = meta.get("price_cents", 0)
+
+        cur_sig = sig_lookup.get(ticker)
+        if cur_sig:
+            model_prob = float(cur_sig.get("model_prob", 0))
+            model_source = "current"
+        else:
+            model_prob = max(0.0, min(0.99, meta.get("edge", 0.0) + entry_cents / 100))
+            model_source = "entry"
 
         bid = prices.get(ticker)
         current_bid_cents = round(bid * 100) if bid else None
@@ -480,6 +491,8 @@ def api_positions():
             "profit_take_cents": min(99, round(entry_cents * (1 + pt_pct))) if entry_cents else None,
             "source":            meta.get("source", "live"),
             "opened_at":         meta.get("opened_at", ""),
+            "model_prob":        model_prob,
+            "model_source":      model_source,
         })
 
     events = [
@@ -509,12 +522,14 @@ def api_orders():
         except Exception:
             pass
 
-    cfg    = _state["config"]
+    cfg     = _state["config"]
     sl_base = cfg.get("stop_loss_pct", 0.35)
     pt_base = cfg.get("profit_take_pct", 0.50)
 
     with _price_lock:
         prices = dict(_price_cache)
+
+    sig_lookup = {s["ticker"]: s for s in _state.get("signals", [])}
 
     for o in orders:
         ticker = o.get("ticker", "")
@@ -528,6 +543,14 @@ def api_orders():
         else:
             o["stop_loss_cents"]   = None
             o["profit_take_cents"] = None
+
+        cur_sig = sig_lookup.get(ticker)
+        if cur_sig:
+            o["model_prob"]   = float(cur_sig.get("model_prob", 0))
+            o["model_source"] = "current"
+        else:
+            o["model_prob"]   = max(0.0, min(0.99, o.get("edge", 0.0) + ec / 100))
+            o["model_source"] = "entry"
 
     return jsonify(list(reversed(orders[-200:])))
 
@@ -1325,6 +1348,7 @@ HTML = """<!DOCTYPE html>
           <th title="Unrealized P&L based on current bid">Unreal P&L</th>
           <th>Invested</th><th>Fees</th>
           <th title="Stop-loss / Profit-take trigger prices (cost-scaled)">SL / PT</th>
+          <th title="Model win probability">Conf</th>
           <th>Opened</th>
         </tr></thead>
         <tbody id="pos-body"></tbody>
@@ -1345,6 +1369,7 @@ HTML = """<!DOCTYPE html>
           <th>Entry</th><th>Cost</th><th>Edge</th>
           <th title="Current yes_bid from last scan">Current</th>
           <th title="Stop-loss ↓ / Profit-take ↑ trigger prices">SL↓ / PT↑</th>
+          <th title="Model win probability (current if scanner active, entry estimate otherwise)">Conf</th>
           <th>Status</th><th>Src</th><th title="ESPN link">ESPN</th><th></th>
         </tr></thead>
         <tbody id="ord-body"></tbody>
@@ -1539,6 +1564,13 @@ function fmtTime(iso) {
   return new Date(iso).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 }
 function edgeCls(e) { return e > 0 ? 'green' : (e < 0 ? 'red' : 'dim'); }
+function confCls(p)  { return p >= 0.70 ? 'green' : p >= 0.55 ? 'yellow' : 'dim'; }
+function confCell(p, src) {
+  if (!p) return '<td class="dim">—</td>';
+  const title = src === 'entry' ? 'title="Entry estimate"' : 'title="Current model"';
+  const dim   = src === 'entry' ? ';opacity:.65' : '';
+  return `<td class="${confCls(p)}" style="font-size:11px${dim}" ${title}>${(p*100).toFixed(0)}%</td>`;
+}
 function fmtResult(o) {
   const won = o.won;
   if (o.result_type === 'exit') {
@@ -1626,7 +1658,7 @@ async function loadSignals() {
         <td class="dim">${s.sport || ''}</td>
         <td><span class="src ${s.source}">${s.source.toUpperCase()}</span></td>
         <td>${pctPlain(s.kalshi_ask)}</td>
-        <td>${pctPlain(s.model_prob)}</td>
+        <td class="${confCls(s.model_prob)}">${pctPlain(s.model_prob)}</td>
         <td class="${edgeCls(s.edge)}">${pct(s.edge)}</td>
         <td>$${(s.kelly_usd || 0).toFixed(2)}</td>
         <td class="dim" style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis">${s.score_state || ''}</td>
@@ -1753,7 +1785,7 @@ async function loadPositions() {
     // ── Positions table ────────────────────────────────────────────────────
     const tbody = document.getElementById('pos-body');
     if (!ps.length) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">No open positions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="10" class="empty">No open positions</td></tr>';
       return;
     }
     tbody.innerHTML = ps.map(p => {
@@ -1779,6 +1811,7 @@ async function loadPositions() {
         <td class="yellow">$${(p.cost_usd||0).toFixed(2)}</td>
         <td class="dim" style="font-size:11px">$${(p.fees_usd||0).toFixed(2)}</td>
         ${slPt}
+        ${confCell(p.model_prob, p.model_source)}
         <td class="dim" style="font-size:11px">${fmtTime(p.opened_at)}</td>
       </tr>`;
     }).join('');
@@ -1817,7 +1850,7 @@ async function loadOrders() {
     const os = await fetch('/api/orders?mode=' + ordersMode).then(r => r.json());
     const tbody = document.getElementById('ord-body');
     if (!os.length) {
-      tbody.innerHTML = '<tr><td colspan="13" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="14" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
       return;
     }
     tbody.innerHTML = os.map(o => {
@@ -1859,6 +1892,7 @@ async function loadOrders() {
         <td class="${edgeCls(o.edge)}">${pct(o.edge)}</td>
         ${curCell}
         ${targCell}
+        ${confCell(o.model_prob, o.model_source)}
         <td><span class="st ${o.status}">${o.status}</span></td>
         <td><span class="src ${o.source}">${o.source}</span></td>
         ${espnCell}
