@@ -1646,41 +1646,72 @@ async function loadPositions() {
     cashEl.textContent = cash != null ? '$' + cash.toFixed(2) : '—';
 
     // ── Event exposure bars ────────────────────────────────────────────────
-    // Build unrealized P&L per event from position data
-    const eventPnl = {};
+    // Aggregate P&L and SL/PT fractions per event from position data
+    const eventPnl    = {};
+    const eventThresh = {};
     ps.forEach(p => {
       const evKey = p.ticker.split('-').slice(0, -1).join('-');
-      if (p.unrealized_pnl != null) {
+      if (p.unrealized_pnl != null)
         eventPnl[evKey] = (eventPnl[evKey] || 0) + p.unrealized_pnl;
+      if (p.price_cents && p.stop_loss_cents && p.profit_take_cents) {
+        const slF = (p.price_cents - p.stop_loss_cents) / p.price_cents;
+        const ptF = (p.profit_take_cents - p.price_cents) / p.price_cents;
+        const w   = p.cost_usd || 1;
+        if (!eventThresh[evKey]) eventThresh[evKey] = { slW: 0, ptW: 0, wSum: 0 };
+        eventThresh[evKey].slW  += slF * w;
+        eventThresh[evKey].ptW  += ptF * w;
+        eventThresh[evKey].wSum += w;
       }
     });
 
     const barsEl  = document.getElementById('p-event-bars');
     const maxCost = events.reduce((m, e) => Math.max(m, e.cost_usd), 0) || 1;
     barsEl.innerHTML = events.map(e => {
-      const pct    = (e.cost_usd / maxCost * 100).toFixed(1);
-      const pctT   = (e.cost_usd / (totalInvested || 1) * 100).toFixed(0);
-      const lbl    = parseEventLabel(e.event_ticker);
-      const pnl    = eventPnl[e.event_ticker] ?? null;
+      const pct  = (e.cost_usd / maxCost * 100).toFixed(1);
+      const pctT = (e.cost_usd / (totalInvested || 1) * 100).toFixed(0);
+      const lbl  = parseEventLabel(e.event_ticker);
+      const pnl  = eventPnl[e.event_ticker] ?? null;
       const pnlStr = pnl != null
         ? `<span class="${pnl >= 0 ? 'green' : 'red'}" style="font-size:11px;margin-left:8px">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</span>`
         : '';
-      // P&L bar: width relative to cost, green if gain, red if loss
-      const pnlBarPct = pnl != null ? Math.min(Math.abs(pnl) / e.cost_usd * 100, 100).toFixed(1) : 0;
-      const pnlBarColor = pnl != null && pnl >= 0 ? '#00ff88' : '#ff6b6b';
+
+      // SL / PT gauge
+      const th = eventThresh[e.event_ticker];
+      const slF = th ? th.slW / th.wSum : 0.28;
+      const ptF = th ? th.ptW / th.wSum : 0.40;
+      const totalRange = slF + ptF;
+      const centerPct  = (slF / totalRange * 100).toFixed(2);  // entry point %
+      const pnlFrac    = pnl != null ? pnl / e.cost_usd : null;
+      const gaugePct   = pnlFrac != null
+        ? Math.max(0, Math.min(100, (slF + pnlFrac) / totalRange * 100))
+        : null;
+      // filled bar: from center toward current position
+      const fillLeft  = gaugePct != null ? Math.min(+centerPct, gaugePct).toFixed(2) : centerPct;
+      const fillW     = gaugePct != null ? Math.abs(gaugePct - +centerPct).toFixed(2) : 0;
+      const fillColor = pnlFrac != null && pnlFrac >= 0 ? '#00ff88' : '#ff6b6b';
+
       return `
-        <div style="margin-bottom:14px">
-          <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-bottom:3px">
+        <div style="margin-bottom:18px">
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-bottom:4px">
             <span>${lbl}</span>
             <span><span class="yellow">$${e.cost_usd.toFixed(2)}</span>${pnlStr}</span>
           </div>
-          <div style="background:#1a1a2e;border-radius:3px;height:8px;overflow:hidden;margin-bottom:2px">
+          <div style="background:#1a1a2e;border-radius:3px;height:7px;overflow:hidden;margin-bottom:5px">
             <div style="width:${pct}%;height:100%;background:linear-gradient(90deg,#4ea8de,#6c63ff);border-radius:3px"></div>
           </div>
-          <div style="background:#111;border-radius:3px;height:5px;overflow:hidden;margin-bottom:3px">
-            <div style="width:${pnlBarPct}%;height:100%;background:${pnlBarColor};border-radius:3px;transition:width .4s"></div>
+          <div style="position:relative;height:10px;border-radius:3px;overflow:hidden;background:#111;margin-bottom:3px">
+            <div style="position:absolute;left:0;width:${centerPct}%;height:100%;background:#ff6b6b18"></div>
+            <div style="position:absolute;left:${centerPct}%;right:0;height:100%;background:#00ff8818"></div>
+            <div style="position:absolute;left:0;width:2px;height:100%;background:#ff6b6b;opacity:.7"></div>
+            <div style="position:absolute;right:0;width:2px;height:100%;background:#00ff88;opacity:.7"></div>
+            <div style="position:absolute;left:${centerPct}%;width:1px;height:100%;background:#444"></div>
+            <div style="position:absolute;left:${fillLeft}%;width:${fillW}%;height:100%;background:${fillColor};opacity:.75;transition:all .4s"></div>
           </div>
-          <div style="font-size:10px;color:#555">${e.contracts} contracts · ${pctT}% of portfolio</div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:#555;margin-bottom:1px">
+            <span style="color:#ff6b6b88">SL −${(slF*100).toFixed(0)}%</span>
+            <span>${e.contracts} contracts · ${pctT}% of portfolio</span>
+            <span style="color:#00ff8888">PT +${(ptF*100).toFixed(0)}%</span>
+          </div>
         </div>`;
     }).join('');
 
