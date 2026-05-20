@@ -30,8 +30,10 @@ MIN_ASK     = 0.05    # skip if market prices YES below this — near-zero asks 
 STOP_LOSS_PCT   = 0.35   # sell if bid drops this fraction below entry price
 PROFIT_TAKE_PCT = 0.50   # sell if bid rises this fraction above entry price
 
-LOG_FILE      = Path("orders.jsonl")
-EXIT_LOG_FILE = Path("exits.jsonl")
+ORDERS_DRY_FILE  = Path("orders_dry.jsonl")
+ORDERS_LIVE_FILE = Path("orders_live.jsonl")
+EXITS_DRY_FILE   = Path("exits_dry.jsonl")
+EXITS_LIVE_FILE  = Path("exits_live.jsonl")
 
 # ── Open-position deduplication ───────────────────────────────────────────────
 # Tickers we already hold (bought but not yet exited/settled).
@@ -41,24 +43,26 @@ _open_tickers: set[str] = set()
 
 
 def _load_open_tickers():
-    """Rebuild _open_tickers from orders.jsonl minus exits.jsonl at startup."""
+    """Rebuild _open_tickers from all order logs minus exit logs at startup."""
     global _open_tickers
     bought: set[str] = set()
-    if LOG_FILE.exists():
-        for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
-            try:
-                o = json.loads(line)
-                if o.get("status") in ("dry_run", "submitted", "resting") and o.get("contracts", 0) > 0:
-                    bought.add(o["ticker"])
-            except Exception:
-                pass
+    for f in (ORDERS_DRY_FILE, ORDERS_LIVE_FILE):
+        if f.exists():
+            for line in f.read_text(encoding="utf-8").splitlines():
+                try:
+                    o = json.loads(line)
+                    if o.get("status") in ("dry_run", "submitted", "resting") and o.get("contracts", 0) > 0:
+                        bought.add(o["ticker"])
+                except Exception:
+                    pass
     exited: set[str] = set()
-    if EXIT_LOG_FILE.exists():
-        for line in EXIT_LOG_FILE.read_text(encoding="utf-8").splitlines():
-            try:
-                exited.add(json.loads(line)["ticker"])
-            except Exception:
-                pass
+    for f in (EXITS_DRY_FILE, EXITS_LIVE_FILE):
+        if f.exists():
+            for line in f.read_text(encoding="utf-8").splitlines():
+                try:
+                    exited.add(json.loads(line)["ticker"])
+                except Exception:
+                    pass
     _open_tickers = bought - exited
 
 
@@ -342,10 +346,12 @@ def _print(r: OrderResult):
 
 
 def _log(r: OrderResult):
-    with LOG_FILE.open("a") as f:
-        f.write(json.dumps(asdict(r)) + "\n")
+    f = ORDERS_DRY_FILE if r.dry_run else ORDERS_LIVE_FILE
+    with f.open("a") as fh:
+        fh.write(json.dumps(asdict(r)) + "\n")
 
 
 def _log_exit(r: ExitResult):
-    with EXIT_LOG_FILE.open("a") as f:
-        f.write(json.dumps(asdict(r)) + "\n")
+    f = EXITS_DRY_FILE if r.dry_run else EXITS_LIVE_FILE
+    with f.open("a") as fh:
+        fh.write(json.dumps(asdict(r)) + "\n")

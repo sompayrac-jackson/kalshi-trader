@@ -35,10 +35,22 @@ except ImportError:
 
 KALSHI_API_KEY = config.KALSHI_API_KEY
 ODDS_API_KEY   = config.ODDS_API_KEY
-POSITIONS_FILE  = Path("positions.jsonl")
-ORDERS_FILE     = Path("orders.jsonl")
-EXITS_FILE      = Path("exits.jsonl")
-PERF_CACHE_FILE = Path("perf_cache.json")
+POSITIONS_FILE    = Path("positions.jsonl")
+ORDERS_DRY_FILE   = Path("orders_dry.jsonl")
+ORDERS_LIVE_FILE  = Path("orders_live.jsonl")
+EXITS_DRY_FILE    = Path("exits_dry.jsonl")
+EXITS_LIVE_FILE   = Path("exits_live.jsonl")
+PERF_CACHE_DRY    = Path("perf_cache_dry.json")
+PERF_CACHE_LIVE   = Path("perf_cache_live.json")
+
+def _orders_file(mode: str) -> Path:
+    return ORDERS_LIVE_FILE if mode == "live" else ORDERS_DRY_FILE
+
+def _exits_file(mode: str) -> Path:
+    return EXITS_LIVE_FILE if mode == "live" else EXITS_DRY_FILE
+
+def _perf_cache_file(mode: str) -> Path:
+    return PERF_CACHE_LIVE if mode == "live" else PERF_CACHE_DRY
 
 app = Flask(__name__)
 
@@ -152,18 +164,20 @@ def _check_exits(client: KalshiClient):
     except Exception as e:
         _log(f"[EXIT] positions fetch failed: {e}")
 
-    # Virtual positions in dry-run: orders.jsonl entries not yet in exits.jsonl
+    # Virtual positions in dry-run: orders_dry.jsonl entries not yet in exits_dry.jsonl
     virtual_positions: list[dict] = []
-    if dry_run and ORDERS_FILE.exists():
+    orders_f = _orders_file("dry" if dry_run else "live")
+    exits_f  = _exits_file("dry" if dry_run else "live")
+    if dry_run and orders_f.exists():
         exited = set()
-        if EXITS_FILE.exists():
-            for line in EXITS_FILE.read_text(encoding="utf-8").splitlines():
+        if exits_f.exists():
+            for line in exits_f.read_text(encoding="utf-8").splitlines():
                 try:
                     exited.add(json.loads(line)["ticker"])
                 except Exception:
                     pass
         seen = set()
-        for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+        for line in orders_f.read_text(encoding="utf-8").splitlines():
             try:
                 o = json.loads(line)
                 t = o.get("ticker", "")
@@ -181,10 +195,10 @@ def _check_exits(client: KalshiClient):
             except Exception:
                 pass
 
-    # Build entry-price map from orders.jsonl (first logged order per ticker)
+    # Build entry-price map from appropriate orders file (first logged order per ticker)
     entry_map: dict[str, dict] = {}
-    if ORDERS_FILE.exists():
-        for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+    if orders_f.exists():
+        for line in orders_f.read_text(encoding="utf-8").splitlines():
             try:
                 o = json.loads(line)
                 t = o.get("ticker", "")
@@ -349,10 +363,12 @@ def api_positions():
 @app.route("/api/orders")
 @_require_auth
 def api_orders():
-    if not ORDERS_FILE.exists():
+    mode = request.args.get("mode", "dry")
+    f = _orders_file(mode)
+    if not f.exists():
         return jsonify([])
     orders = []
-    for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+    for line in f.read_text(encoding="utf-8").splitlines():
         try:
             orders.append(json.loads(line))
         except Exception:
@@ -360,12 +376,23 @@ def api_orders():
     return jsonify(list(reversed(orders[-200:])))
 
 
+_ALL_LOG_FILES = (
+    ORDERS_DRY_FILE, ORDERS_LIVE_FILE,
+    EXITS_DRY_FILE,  EXITS_LIVE_FILE,
+    PERF_CACHE_DRY,  PERF_CACHE_LIVE,
+)
+
+
 @app.route("/api/logs/archive", methods=["POST"])
 @_require_auth
 def api_logs_archive():
-    ts  = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    mode = request.get_json(silent=True, force=True).get("mode", "all") if request.data else "all"
+    ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     moved = []
-    for f in (ORDERS_FILE, EXITS_FILE, PERF_CACHE_FILE):
+    targets = _ALL_LOG_FILES if mode == "all" else (
+        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode))
+    )
+    for f in targets:
         if f.exists():
             dest = f.with_name(f"{f.stem}_{ts}{f.suffix}")
             f.rename(dest)
@@ -377,7 +404,11 @@ def api_logs_archive():
 @app.route("/api/logs/clear", methods=["POST"])
 @_require_auth
 def api_logs_clear():
-    for f in (ORDERS_FILE, EXITS_FILE, PERF_CACHE_FILE):
+    mode = request.get_json(silent=True, force=True).get("mode", "all") if request.data else "all"
+    targets = _ALL_LOG_FILES if mode == "all" else (
+        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode))
+    )
+    for f in targets:
         if f.exists():
             f.unlink()
     executor._load_open_tickers()
@@ -685,43 +716,53 @@ def api_upcoming():
 
 # ── Performance tracker ───────────────────────────────────────────────────────
 
-def _load_perf_cache() -> dict:
-    if not PERF_CACHE_FILE.exists():
+def _load_perf_cache(mode: str) -> dict:
+    f = _perf_cache_file(mode)
+    if not f.exists():
         return {}
     try:
-        return json.loads(PERF_CACHE_FILE.read_text(encoding="utf-8"))
+        return json.loads(f.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
-def _save_perf_cache(cache: dict):
-    PERF_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+def _save_perf_cache(cache: dict, mode: str):
+    _perf_cache_file(mode).write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
 
 @app.route("/api/performance")
 @_require_auth
 def api_performance():
-    # Load all logged orders
+    mode = request.args.get("mode", "dry")  # 'dry' or 'live'
+
+    # Load orders for this mode
     all_orders: list[dict] = []
-    if ORDERS_FILE.exists():
-        for line in ORDERS_FILE.read_text(encoding="utf-8").splitlines():
+    f = _orders_file(mode)
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
             try:
                 all_orders.append(json.loads(line))
             except Exception:
                 pass
 
-    # Include: confirmed dry_run orders + liquidity-skipped orders (model said buy)
-    virtual = [
-        o for o in all_orders
-        if o.get("dry_run") and o.get("contracts", 0) > 0
-        and o.get("status") in ("dry_run", "skipped")
-        and ("liquidity" in o.get("error", "") or o.get("status") == "dry_run")
-    ]
+    # For dry: only confirmed dry_run fills. For live: only real fills.
+    if mode == "dry":
+        candidates = [
+            o for o in all_orders
+            if o.get("contracts", 0) > 0
+            and o.get("status") == "dry_run"
+        ]
+    else:
+        candidates = [
+            o for o in all_orders
+            if o.get("contracts", 0) > 0
+            and o.get("status") in ("submitted", "resting", "filled")
+        ]
 
     # Load and refresh resolution cache
-    perf_cache = _load_perf_cache()
+    perf_cache = _load_perf_cache(mode)
     unresolved_tickers = {
-        o["ticker"] for o in virtual
+        o["ticker"] for o in candidates
         if o["ticker"] not in perf_cache
     }
 
@@ -735,7 +776,9 @@ def api_performance():
                     perf_cache[ticker] = result
             except Exception:
                 pass
-        _save_perf_cache(perf_cache)
+        _save_perf_cache(perf_cache, mode)
+
+    virtual = candidates  # rename for clarity below
 
     # Build resolved / pending lists
     resolved_orders: list[dict] = []
@@ -774,9 +817,10 @@ def api_performance():
         b["pnl"]  += o["pnl"]
 
     return jsonify({
+        "mode": mode,
         "summary": {
-            "total_virtual_bets": len(virtual),
-            "resolved":           n,
+            "total_bets": len(virtual),
+            "resolved":   n,
             "pending":            len(pending_orders),
             "wins":               wins,
             "losses":             n - wins,
@@ -890,6 +934,9 @@ HTML = """<!DOCTYPE html>
   /* Status badge */
   .st{font-size:11px}
   .st.dry_run{color:#888}
+  .mode-bar{display:flex;gap:6px;margin-bottom:16px}
+  .mode-btn{padding:5px 16px;border:1px solid #333;background:#111;color:#888;border-radius:4px;cursor:pointer;font-size:12px;letter-spacing:.04em}
+  .mode-btn.active{background:#1a2a1a;border-color:#4caf50;color:#4caf50}
   .st.submitted,.st.resting{color:#00ff88}
   .st.skipped,.st.error{color:#ff6b6b}
 
@@ -1026,6 +1073,10 @@ HTML = """<!DOCTYPE html>
 
   <!-- ORDERS -->
   <div class="panel" id="panel-orders">
+    <div class="mode-bar">
+      <button class="mode-btn active" id="ord-btn-dry"  onclick="switchOrders('dry')">Paper Trading</button>
+      <button class="mode-btn"        id="ord-btn-live" onclick="switchOrders('live')">Live Trading</button>
+    </div>
     <div class="tbl-wrap">
       <table>
         <thead><tr>
@@ -1039,11 +1090,15 @@ HTML = """<!DOCTYPE html>
 
   <!-- PERFORMANCE -->
   <div class="panel" id="panel-performance">
+    <div class="mode-bar">
+      <button class="mode-btn active" id="pf-btn-dry"  onclick="switchPerf('dry')">Paper Trading</button>
+      <button class="mode-btn"        id="pf-btn-live" onclick="switchPerf('live')">Live Trading</button>
+    </div>
     <div class="stats" id="perf-stats">
-      <div class="card"><div class="lbl">Virtual Bets</div><div class="val" id="pf-total">-</div></div>
+      <div class="card"><div class="lbl" id="pf-lbl-total">Paper Bets</div><div class="val" id="pf-total">-</div></div>
       <div class="card"><div class="lbl">Resolved</div><div class="val" id="pf-resolved">-</div></div>
       <div class="card"><div class="lbl">Win Rate</div><div class="val" id="pf-winrate">-</div></div>
-      <div class="card"><div class="lbl">Hypothetical P&amp;L</div><div class="val" id="pf-pnl">-</div></div>
+      <div class="card"><div class="lbl" id="pf-lbl-pnl">Hypothetical P&amp;L</div><div class="val" id="pf-pnl">-</div></div>
       <div class="card"><div class="lbl">ROI</div><div class="val" id="pf-roi">-</div></div>
     </div>
 
@@ -1135,9 +1190,12 @@ HTML = """<!DOCTYPE html>
         Archive renames them with a timestamp so history is preserved.
         Clear deletes them permanently.
       </p>
-      <div class="controls">
-        <button class="btn btn-gray" onclick="archiveLogs()">Archive Logs</button>
-        <button class="btn btn-red"  onclick="clearLogs()">Clear Logs</button>
+      <div class="controls" style="flex-wrap:wrap;gap:8px">
+        <button class="btn btn-gray"   onclick="archiveLogs('dry')">Archive Paper</button>
+        <button class="btn btn-gray"   onclick="archiveLogs('live')">Archive Live</button>
+        <button class="btn btn-gray"   onclick="archiveLogs('all')">Archive All</button>
+        <button class="btn btn-red"    onclick="clearLogs('dry')">Clear Paper</button>
+        <button class="btn btn-red"    onclick="clearLogs('live')">Clear Live</button>
       </div>
       <p id="log-action-msg" style="font-size:11px;color:#4caf;margin-top:8px"></p>
     </div>
@@ -1307,12 +1365,20 @@ async function loadPositions() {
 }
 
 // ── Orders ─────────────────────────────────────────────────────────────────
+let ordersMode = 'dry';
+function switchOrders(mode) {
+  ordersMode = mode;
+  ['dry','live'].forEach(m => {
+    document.getElementById('ord-btn-'+m).classList.toggle('active', m === mode);
+  });
+  loadOrders();
+}
 async function loadOrders() {
   try {
-    const os = await fetch('/api/orders').then(r => r.json());
+    const os = await fetch('/api/orders?mode=' + ordersMode).then(r => r.json());
     const tbody = document.getElementById('ord-body');
     if (!os.length) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">No orders logged yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
       return;
     }
     tbody.innerHTML = os.map(o => `
@@ -1361,9 +1427,13 @@ async function stopScanner() {
 }
 
 // ── Log management ────────────────────────────────────────────────────────
-async function archiveLogs() {
-  if (!confirm('Archive orders.jsonl, exits.jsonl, and perf_cache.json?\\nFiles will be renamed with a timestamp.')) return;
-  const r = await fetch('/api/logs/archive', {method: 'POST'});
+async function archiveLogs(mode) {
+  const label = mode === 'all' ? 'all' : (mode === 'live' ? 'live' : 'paper');
+  if (!confirm(`Archive ${label} log files?\\nFiles will be renamed with a timestamp.`)) return;
+  const r = await fetch('/api/logs/archive', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode})
+  });
   const d = await r.json();
   const msg = document.getElementById('log-action-msg');
   if (d.ok) {
@@ -1374,13 +1444,17 @@ async function archiveLogs() {
   }
 }
 
-async function clearLogs() {
-  if (!confirm('Permanently delete orders.jsonl, exits.jsonl, and perf_cache.json?\\nThis cannot be undone.')) return;
-  if (!confirm('Are you sure? All performance history will be lost.')) return;
-  const r = await fetch('/api/logs/clear', {method: 'POST'});
+async function clearLogs(mode) {
+  const label = mode === 'all' ? 'all' : (mode === 'live' ? 'live' : 'paper');
+  if (!confirm(`Permanently delete ${label} log files?\\nThis cannot be undone.`)) return;
+  if (!confirm(`Are you sure? All ${label} performance history will be lost.`)) return;
+  const r = await fetch('/api/logs/clear', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode})
+  });
   const d = await r.json();
   const msg = document.getElementById('log-action-msg');
-  msg.textContent = d.ok ? 'Logs cleared.' : 'Error clearing logs.';
+  msg.textContent = d.ok ? `${label.charAt(0).toUpperCase()+label.slice(1)} logs cleared.` : 'Error clearing logs.';
   if (d.ok) loadOrders();
 }
 
@@ -1549,14 +1623,24 @@ async function loadUpcoming() {
 }
 
 // ── Performance ────────────────────────────────────────────────────────────
+let perfMode = 'dry';
+function switchPerf(mode) {
+  perfMode = mode;
+  ['dry','live'].forEach(m => {
+    document.getElementById('pf-btn-'+m).classList.toggle('active', m === mode);
+  });
+  const isLive = mode === 'live';
+  document.getElementById('pf-lbl-total').textContent = isLive ? 'Live Orders' : 'Paper Bets';
+  document.getElementById('pf-lbl-pnl').textContent   = isLive ? 'Realized P&L' : 'Hypothetical P&L';
+  loadPerformance();
+}
 async function loadPerformance() {
-  const container = document.getElementById('perf-stats');
   try {
-    const d = await fetch('/api/performance').then(r => r.json());
+    const d = await fetch('/api/performance?mode=' + perfMode).then(r => r.json());
     const s = d.summary;
     const pnlPos = s.total_pnl >= 0;
 
-    document.getElementById('pf-total').textContent    = s.total_virtual_bets;
+    document.getElementById('pf-total').textContent    = s.total_bets;
     document.getElementById('pf-resolved').textContent = s.resolved;
     document.getElementById('pf-winrate').textContent  = s.resolved ? Math.round(s.win_rate * 100) + '%' : '-';
     const pnlEl = document.getElementById('pf-pnl');
