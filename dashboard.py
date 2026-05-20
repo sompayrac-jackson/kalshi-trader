@@ -80,6 +80,11 @@ def _require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
+# ── Shared state ─────────────────────────────────────────────────────────────
+# Current bid prices for open tickers, refreshed every scan cycle.
+_price_cache: dict[str, float] = {}   # ticker -> yes_bid_dollars
+_price_lock  = threading.Lock()
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 
 _lock       = threading.Lock()
@@ -313,6 +318,20 @@ def _scanner_loop():
         except Exception as e:
             _log(f"Live scan error: {e}")
 
+        # Refresh bid price cache for all open tickers (used by Orders tab)
+        if executor._open_tickers:
+            fresh: dict[str, float] = {}
+            for ticker in list(executor._open_tickers):
+                try:
+                    m   = _client.get_market(ticker)
+                    bid = float(m.get("yes_bid_dollars") or 0)
+                    if bid > 0:
+                        fresh[ticker] = bid
+                except Exception:
+                    pass
+            with _price_lock:
+                _price_cache.update(fresh)
+
         # Exit check — runs every cycle after live scan
         try:
             _check_exits(_client)
@@ -373,6 +392,26 @@ def api_orders():
             orders.append(json.loads(line))
         except Exception:
             pass
+
+    cfg = _state["config"]
+    sl_pct = cfg.get("stop_loss_pct", 0.35)
+    pt_pct = cfg.get("profit_take_pct", 0.50)
+
+    with _price_lock:
+        prices = dict(_price_cache)
+
+    for o in orders:
+        ticker = o.get("ticker", "")
+        bid    = prices.get(ticker)
+        o["current_bid_cents"]  = round(bid * 100) if bid else None
+        ec = o.get("price_cents", 0)
+        if ec > 0:
+            o["stop_loss_cents"]   = round(ec * (1 - sl_pct))
+            o["profit_take_cents"] = min(99, round(ec * (1 + pt_pct)))
+        else:
+            o["stop_loss_cents"]   = None
+            o["profit_take_cents"] = None
+
     return jsonify(list(reversed(orders[-200:])))
 
 
@@ -381,6 +420,36 @@ _ALL_LOG_FILES = (
     EXITS_DRY_FILE,  EXITS_LIVE_FILE,
     PERF_CACHE_DRY,  PERF_CACHE_LIVE,
 )
+
+
+@app.route("/api/sell", methods=["POST"])
+@_require_auth
+def api_sell():
+    data       = request.get_json(silent=True) or {}
+    ticker     = data.get("ticker", "")
+    side       = data.get("side", "yes")
+    contracts  = int(data.get("contracts", 0))
+    entry_cents = int(data.get("entry_cents", 0))
+
+    if not ticker or contracts <= 0:
+        return jsonify({"ok": False, "error": "invalid params"}), 400
+
+    client = _get_client()
+    try:
+        market    = client.get_market(ticker)
+        bid_cents = round(float(market.get("yes_bid_dollars") or 0) * 100)
+        if bid_cents <= 0:
+            return jsonify({"ok": False, "error": "no bid available — market may be settled"}), 400
+        r = executor.execute_exit(client, ticker, side, contracts, entry_cents, bid_cents, "manual")
+        return jsonify({
+            "ok":         True,
+            "status":     r.status,
+            "exit_cents": bid_cents,
+            "pnl":        round(r.pnl_usd, 2),
+            "dry_run":    r.dry_run,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/logs/archive", methods=["POST"])
@@ -1081,7 +1150,10 @@ HTML = """<!DOCTYPE html>
       <table>
         <thead><tr>
           <th>Time</th><th>Player</th><th>Side</th><th>Qty</th>
-          <th>Price</th><th>Cost</th><th>Edge</th><th>Status</th><th>Src</th>
+          <th>Entry</th><th>Cost</th><th>Edge</th>
+          <th title="Current yes_bid from last scan">Current</th>
+          <th title="Stop-loss ↓ / Profit-take ↑ trigger prices">SL↓ / PT↑</th>
+          <th>Status</th><th>Src</th><th></th>
         </tr></thead>
         <tbody id="ord-body"></tbody>
       </table>
@@ -1378,22 +1450,73 @@ async function loadOrders() {
     const os = await fetch('/api/orders?mode=' + ordersMode).then(r => r.json());
     const tbody = document.getElementById('ord-body');
     if (!os.length) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="12" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
       return;
     }
-    tbody.innerHTML = os.map(o => `
-      <tr>
+    tbody.innerHTML = os.map(o => {
+      const isOpen = ['dry_run','submitted','resting'].includes(o.status);
+      const cur    = o.current_bid_cents;
+      const sl     = o.stop_loss_cents;
+      const pt     = o.profit_take_cents;
+      const entry  = o.price_cents || 0;
+
+      // Colour current price relative to entry
+      let curCell = '<td class="dim">—</td>';
+      if (cur != null) {
+        const diff = cur - entry;
+        const cls  = diff > 0 ? 'green' : diff < 0 ? 'red' : '';
+        curCell = `<td class="${cls}">${cur}¢</td>`;
+      }
+
+      // SL / PT targets
+      const targCell = (sl != null && pt != null)
+        ? `<td style="font-size:11px"><span style="color:#ff6b6b">SL:${sl}¢</span> / <span style="color:#00ff88">PT:${pt}¢</span></td>`
+        : '<td class="dim">—</td>';
+
+      // Sell button — only for open positions
+      const sellBtn = isOpen
+        ? `<td><button class="btn btn-red" style="padding:2px 8px;font-size:11px"
+             onclick="sellNow('${o.ticker}','${o.side||'yes'}',${o.contracts},${entry})">Sell</button></td>`
+        : '<td></td>';
+
+      return `<tr>
         <td class="dim" style="font-size:11px">${fmtTime(o.ts)}</td>
         <td>${o.player}</td>
         <td>${(o.side||'').toUpperCase()}</td>
         <td>${o.contracts}</td>
-        <td>${o.price_cents}c</td>
+        <td>${entry}¢</td>
         <td>$${(o.cost_usd||0).toFixed(2)}</td>
         <td class="${edgeCls(o.edge)}">${pct(o.edge)}</td>
+        ${curCell}
+        ${targCell}
         <td><span class="st ${o.status}">${o.status}</span></td>
         <td><span class="src ${o.source}">${o.source}</span></td>
-      </tr>`).join('');
+        ${sellBtn}
+      </tr>`;
+    }).join('');
   } catch(_) {}
+}
+
+async function sellNow(ticker, side, contracts, entry_cents) {
+  const label = ordersMode === 'live' ? 'LIVE' : 'DRY RUN';
+  if (!confirm(`[${label}] Sell ${contracts} ${side.toUpperCase()} contracts?\nTicker: ${ticker}\nEntry: ${entry_cents}¢\n\nThis will execute at current bid.`)) return;
+  try {
+    const r = await fetch('/api/sell', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ticker, side, contracts, entry_cents})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      const pnlSign = d.pnl >= 0 ? '+' : '';
+      alert(`${d.dry_run ? '[DRY RUN] ' : ''}Sold @ ${d.exit_cents}¢\nP&L: ${pnlSign}$${d.pnl.toFixed(2)}`);
+      loadOrders();
+    } else {
+      alert('Sell failed: ' + d.error);
+    }
+  } catch(e) {
+    alert('Sell error: ' + e);
+  }
 }
 
 // ── Log ────────────────────────────────────────────────────────────────────
