@@ -90,6 +90,7 @@ _state: dict = {
         "live_interval_sec": 30,
         "stop_loss_pct":     0.35,
         "profit_take_pct":   0.50,
+        "min_ask":           0.05,
     },
 }
 
@@ -127,8 +128,9 @@ def _sync_executor_config():
     executor.DRY_RUN        = _state["dry_run"]
     executor.MIN_EDGE       = cfg["min_edge"]
     executor.MAX_BET_USD    = cfg["max_bet_usd"]
-    executor.STOP_LOSS_PCT  = cfg["stop_loss_pct"]
+    executor.STOP_LOSS_PCT   = cfg["stop_loss_pct"]
     executor.PROFIT_TAKE_PCT = cfg["profit_take_pct"]
+    executor.MIN_ASK         = cfg["min_ask"]
     live_mod.MIN_EDGE       = cfg["min_edge"]
     live_mod.KELLY_FRACTION = cfg["kelly_fraction"]
 
@@ -250,6 +252,7 @@ def _scanner_loop():
     global _client
     _client  = KalshiClient(api_key_id=KALSHI_API_KEY)
     last_arb = 0.0
+    executor._load_open_tickers()  # rebuild from logs on each scanner start
 
     while not _stop_event.is_set():
         cfg = _state["config"]
@@ -405,6 +408,7 @@ _CONFIG_BOUNDS = {
     "live_interval_sec": (10,   300),
     "stop_loss_pct":     (0.10, 0.60),
     "profit_take_pct":   (0.20, 0.90),
+    "min_ask":           (0.02, 0.25),
 }
 
 @app.route("/api/config", methods=["POST"])
@@ -1063,6 +1067,15 @@ HTML = """<!DOCTYPE html>
         <span class="cfg-val" id="val-min-edge">4%</span>
       </div>
       <div class="cfg-row">
+        <label>Min YES Ask</label>
+        <input type="range" id="rng-min-ask" min="2" max="25" step="1"
+               oninput="showVal('min-ask', this.value + '¢')">
+        <span class="cfg-val" id="val-min-ask">5¢</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:8px">
+        Skip markets where YES trades below this price — near-zero asks mean the player is nearly eliminated and the market has already priced that in.
+      </p>
+      <div class="cfg-row">
         <label>Max Bet (USD)</label>
         <input type="range" id="rng-max-bet" min="5" max="200" step="5"
                oninput="showVal('max-bet', '$'+this.value)">
@@ -1178,6 +1191,8 @@ function syncSliders(cfg) {
            Math.round((cfg.stop_loss_pct   || 0.35) * 100) + '%');
   setValue('profit-take',  Math.round((cfg.profit_take_pct || 0.50) * 100),
            Math.round((cfg.profit_take_pct || 0.50) * 100) + '%');
+  setValue('min-ask', Math.round((cfg.min_ask || 0.05) * 100),
+           Math.round((cfg.min_ask || 0.05) * 100) + '¢');
   const arbH = Math.max(1, Math.round(cfg.arb_interval_sec / 3600));
   setValue('arb-int', arbH, arbH + 'h');
 }
@@ -1317,6 +1332,7 @@ async function saveConfig() {
     arb_interval_sec:  parseFloat(document.getElementById('rng-arb-int').value) * 3600,
     stop_loss_pct:     parseFloat(document.getElementById('rng-stop-loss').value) / 100,
     profit_take_pct:   parseFloat(document.getElementById('rng-profit-take').value) / 100,
+    min_ask:           parseFloat(document.getElementById('rng-min-ask').value) / 100,
   };
   const r = await fetch('/api/config', {
     method: 'POST',

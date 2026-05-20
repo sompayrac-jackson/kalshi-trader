@@ -24,12 +24,45 @@ DRY_RUN     = True    # SAFETY: set False only to place real orders
 MAX_BET_USD = 25.0    # hard cap per order regardless of Kelly
 MIN_BET_USD = 1.0     # ignore signals below this size
 MIN_EDGE    = 0.03    # skip signals below this edge even if passed in
+MIN_ASK     = 0.05    # skip if market prices YES below this — near-zero asks mean
+                      # the market has almost certainly priced out this player already
 
 STOP_LOSS_PCT   = 0.35   # sell if bid drops this fraction below entry price
 PROFIT_TAKE_PCT = 0.50   # sell if bid rises this fraction above entry price
 
 LOG_FILE      = Path("orders.jsonl")
 EXIT_LOG_FILE = Path("exits.jsonl")
+
+# ── Open-position deduplication ───────────────────────────────────────────────
+# Tickers we already hold (bought but not yet exited/settled).
+# Prevents re-buying the same live market every scan cycle.
+
+_open_tickers: set[str] = set()
+
+
+def _load_open_tickers():
+    """Rebuild _open_tickers from orders.jsonl minus exits.jsonl at startup."""
+    global _open_tickers
+    bought: set[str] = set()
+    if LOG_FILE.exists():
+        for line in LOG_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                o = json.loads(line)
+                if o.get("status") in ("dry_run", "submitted", "resting") and o.get("contracts", 0) > 0:
+                    bought.add(o["ticker"])
+            except Exception:
+                pass
+    exited: set[str] = set()
+    if EXIT_LOG_FILE.exists():
+        for line in EXIT_LOG_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                exited.add(json.loads(line)["ticker"])
+            except Exception:
+                pass
+    _open_tickers = bought - exited
+
+
+_load_open_tickers()
 
 
 # ── Order result ──────────────────────────────────────────────────────────────
@@ -89,6 +122,14 @@ def execute(
     ts = datetime.now(timezone.utc).isoformat()
 
     # ── Validation ────────────────────────────────────────────────────────────
+    if ticker in _open_tickers:
+        return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, source,
+                     "already holding position in this market")
+
+    if ask_dollars < MIN_ASK:
+        return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, source,
+                     f"yes_ask {ask_dollars:.2f} below min {MIN_ASK:.2f} — market has priced out player")
+
     if edge < MIN_EDGE:
         return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, source,
                      f"edge {edge:.1%} below minimum {MIN_EDGE:.1%}")
@@ -157,6 +198,7 @@ def execute(
     if DRY_RUN:
         result.status   = "dry_run"
         result.order_id = f"dry-{uuid.uuid4().hex[:8]}"
+        _open_tickers.add(ticker)
         _print(result)
         _log(result)
         return result
@@ -171,6 +213,8 @@ def execute(
         )
         result.order_id = resp.get("order", {}).get("order_id", "")
         result.status   = resp.get("order", {}).get("status", "submitted")
+        if result.status in ("submitted", "resting"):
+            _open_tickers.add(ticker)
         _print(result)
         _log(result)
     except Exception as e:
@@ -252,6 +296,7 @@ def execute_exit(
     if DRY_RUN:
         result.status   = "dry_run"
         result.order_id = f"dry-exit-{uuid.uuid4().hex[:8]}"
+        _open_tickers.discard(ticker)
         _log_exit(result)
         return result
 
@@ -264,6 +309,7 @@ def execute_exit(
         )
         result.order_id = resp.get("order", {}).get("order_id", "")
         result.status   = resp.get("order", {}).get("status", "submitted")
+        _open_tickers.discard(ticker)
         _log_exit(result)
     except Exception as e:
         result.status = "error"
