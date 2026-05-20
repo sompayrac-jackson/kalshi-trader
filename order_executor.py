@@ -52,7 +52,7 @@ def _load_open_tickers():
             for line in f.read_text(encoding="utf-8").splitlines():
                 try:
                     o = json.loads(line)
-                    if o.get("status") in ("dry_run", "submitted", "resting") and o.get("contracts", 0) > 0:
+                    if o.get("status") in ("dry_run", "submitted", "resting", "executed") and o.get("contracts", 0) > 0:
                         bought.add(o["ticker"])
                 except Exception:
                     pass
@@ -218,7 +218,7 @@ def execute(
         )
         result.order_id = resp.get("order", {}).get("order_id", "")
         result.status   = resp.get("order", {}).get("status", "submitted")
-        if result.status in ("submitted", "resting"):
+        if result.status in ("submitted", "resting", "executed"):
             _open_tickers.add(ticker)
             notifier.notify_buy(ticker, player, side, contracts,
                                 price_cents, cost_usd, edge)
