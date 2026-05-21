@@ -43,12 +43,17 @@ EXITS_DRY_FILE    = Path("exits_dry.jsonl")
 EXITS_LIVE_FILE   = Path("exits_live.jsonl")
 PERF_CACHE_DRY    = Path("perf_cache_dry.json")
 PERF_CACHE_LIVE   = Path("perf_cache_live.json")
+SIGNALS_DRY_FILE  = Path("signals_dry.jsonl")
+SIGNALS_LIVE_FILE = Path("signals_live.jsonl")
 
 def _orders_file(mode: str) -> Path:
     return ORDERS_LIVE_FILE if mode == "live" else ORDERS_DRY_FILE
 
 def _exits_file(mode: str) -> Path:
     return EXITS_LIVE_FILE if mode == "live" else EXITS_DRY_FILE
+
+def _signals_file(mode: str) -> Path:
+    return SIGNALS_LIVE_FILE if mode == "live" else SIGNALS_DRY_FILE
 
 def _perf_cache_file(mode: str) -> Path:
     return PERF_CACHE_LIVE if mode == "live" else PERF_CACHE_DRY
@@ -439,17 +444,32 @@ def _scanner_loop():
             _log("Running live scan...")
             live = scan_live(_client)
             for s in live:
-                signals.append(_to_dict(s, "live"))
+                d = _to_dict(s, "live")
+                signals.append(d)
                 if s.edge > 0:
                     try:
                         r = executor.execute_live(_client, s)
+                        d["exec_status"] = r.status
+                        d["exec_error"]  = r.error or None
                         _log(f"[LIVE] {r.player} — {r.status} {r.error or ''}")
                     except Exception as e:
+                        d["exec_status"] = "error"
+                        d["exec_error"]  = str(e)
                         _log(f"[LIVE] execute error: {e}")
+                else:
+                    d["exec_status"] = None
+                    d["exec_error"]  = None
             with _lock:
                 _state["signals"]        = signals
                 _state["last_live_scan"] = datetime.now(timezone.utc).isoformat()
             _log(f"Live scan done — {len(live)} live signals")
+
+            # Append all signals to today's signal log (buys + skips, full context)
+            dry_run = _state["dry_run"]
+            sig_f   = SIGNALS_DRY_FILE if dry_run else SIGNALS_LIVE_FILE
+            with sig_f.open("a", encoding="utf-8") as fh:
+                for d in signals:
+                    fh.write(json.dumps(d) + "\n")
         except Exception as e:
             _log(f"Live scan error: {e}")
 
@@ -650,9 +670,10 @@ def api_orders():
 
 
 _ALL_LOG_FILES = (
-    ORDERS_DRY_FILE, ORDERS_LIVE_FILE,
-    EXITS_DRY_FILE,  EXITS_LIVE_FILE,
-    PERF_CACHE_DRY,  PERF_CACHE_LIVE,
+    ORDERS_DRY_FILE,  ORDERS_LIVE_FILE,
+    EXITS_DRY_FILE,   EXITS_LIVE_FILE,
+    PERF_CACHE_DRY,   PERF_CACHE_LIVE,
+    SIGNALS_DRY_FILE, SIGNALS_LIVE_FILE,
 )
 
 
@@ -721,7 +742,7 @@ def api_logs_archive():
     ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     moved = []
     targets = _ALL_LOG_FILES if mode == "all" else (
-        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode))
+        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode), _signals_file(mode))
     )
     for f in targets:
         if f.exists():
@@ -737,7 +758,7 @@ def api_logs_archive():
 def api_logs_clear():
     mode = request.get_json(silent=True, force=True).get("mode", "all") if request.data else "all"
     targets = _ALL_LOG_FILES if mode == "all" else (
-        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode))
+        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode), _signals_file(mode))
     )
     for f in targets:
         if f.exists():
@@ -751,6 +772,79 @@ def api_logs_clear():
 def api_log():
     with _lock:
         return jsonify(_state["log"][-150:])
+
+
+@app.route("/api/analysis")
+@_require_auth
+def api_analysis():
+    mode = request.args.get("mode", "dry")
+    f    = _signals_file(mode)
+    sigs = []
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
+            try:
+                sigs.append(json.loads(line))
+            except Exception:
+                pass
+
+    total      = len(sigs)
+    buy_sigs   = [s for s in sigs if s.get("direction") == "BUY"]
+    executed   = [s for s in sigs if s.get("exec_status") in
+                  ("dry_run", "submitted", "resting", "executed")]
+
+    # Skip reasons — buy signals that weren't placed
+    skip_reasons: dict[str, int] = {}
+    for s in buy_sigs:
+        if s.get("exec_status") not in ("dry_run", "submitted", "resting", "executed"):
+            err = (s.get("exec_error") or s.get("exec_status") or "unknown").strip()
+            skip_reasons[err] = skip_reasons.get(err, 0) + 1
+
+    # Sport breakdown
+    by_sport: dict[str, dict] = {}
+    for s in sigs:
+        sport = s.get("sport", "unknown")
+        b = by_sport.setdefault(sport, {"total": 0, "buys": 0, "executed": 0, "avg_edge": 0.0, "_edge_sum": 0.0})
+        b["total"] += 1
+        if s.get("direction") == "BUY":
+            b["buys"] += 1
+            b["_edge_sum"] += float(s.get("edge", 0))
+        if s.get("exec_status") in ("dry_run", "submitted", "resting", "executed"):
+            b["executed"] += 1
+    for b in by_sport.values():
+        b["avg_edge"] = round(b["_edge_sum"] / b["buys"], 4) if b["buys"] else 0
+        del b["_edge_sum"]
+
+    # Model confidence distribution
+    buckets = {"<50": 0, "50-60": 0, "60-70": 0, "70-80": 0, "80-90": 0, "90+": 0}
+    for s in sigs:
+        mp = float(s.get("model_prob", 0)) * 100
+        if   mp < 50: buckets["<50"]   += 1
+        elif mp < 60: buckets["50-60"] += 1
+        elif mp < 70: buckets["60-70"] += 1
+        elif mp < 80: buckets["70-80"] += 1
+        elif mp < 90: buckets["80-90"] += 1
+        else:         buckets["90+"]   += 1
+
+    # Edge distribution for buys
+    edge_vals = [float(s.get("edge", 0)) for s in buy_sigs]
+    avg_edge  = round(sum(edge_vals) / len(edge_vals), 4) if edge_vals else 0
+    max_edge  = round(max(edge_vals), 4) if edge_vals else 0
+
+    return jsonify({
+        "summary": {
+            "total_signals":   total,
+            "buy_signals":     len(buy_sigs),
+            "executed":        len(executed),
+            "buy_rate":        round(len(buy_sigs) / total, 3) if total else 0,
+            "exec_rate":       round(len(executed) / len(buy_sigs), 3) if buy_sigs else 0,
+            "avg_edge":        avg_edge,
+            "max_edge":        max_edge,
+        },
+        "by_sport":    by_sport,
+        "skip_reasons": dict(sorted(skip_reasons.items(), key=lambda x: -x[1])),
+        "conf_buckets": buckets,
+        "signals":     list(reversed(sigs[-500:])),
+    })
 
 
 @app.route("/api/start", methods=["POST"])
@@ -1376,6 +1470,7 @@ HTML = """<!DOCTYPE html>
   <div class="tab" onclick="showTab('positions')">Portfolio</div>
   <div class="tab" onclick="showTab('orders')">Orders</div>
   <div class="tab" onclick="showTab('performance')">Performance</div>
+  <div class="tab" onclick="showTab('analysis')">Analysis</div>
   <div class="tab" onclick="showTab('log')">Log</div>
   <div class="tab" onclick="showTab('settings')">Settings</div>
 </div>
@@ -1509,6 +1604,85 @@ HTML = """<!DOCTYPE html>
         </tr></thead>
         <tbody id="perf-body"></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- ANALYSIS -->
+  <div class="panel" id="panel-analysis">
+    <div class="mode-bar">
+      <button class="mode-btn active" id="an-btn-dry"  onclick="switchAnalysis('dry')">Paper</button>
+      <button class="mode-btn"        id="an-btn-live" onclick="switchAnalysis('live')">Live</button>
+    </div>
+
+    <div class="stats" id="an-stats">
+      <div class="card"><div class="lbl">Signals Logged</div><div class="val" id="an-total">-</div></div>
+      <div class="card"><div class="lbl">Buy Signals</div><div class="val" id="an-buys">-</div></div>
+      <div class="card"><div class="lbl">Executed</div><div class="val" id="an-exec">-</div></div>
+      <div class="card"><div class="lbl">Buy Rate</div><div class="val" id="an-buyrate">-</div></div>
+      <div class="card"><div class="lbl">Exec Rate</div><div class="val" id="an-execrate">-</div></div>
+      <div class="card"><div class="lbl">Avg Edge (buys)</div><div class="val green" id="an-avgedge">-</div></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:16px">
+
+      <div class="setting-group" style="margin:0">
+        <h3>By Sport</h3>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:#888;text-align:left">
+            <th style="padding:4px 6px">Sport</th>
+            <th style="padding:4px 6px;text-align:right">Total</th>
+            <th style="padding:4px 6px;text-align:right">Buys</th>
+            <th style="padding:4px 6px;text-align:right">Placed</th>
+            <th style="padding:4px 6px;text-align:right">Avg Edge</th>
+          </tr></thead>
+          <tbody id="an-sport-body"><tr><td colspan="5" class="empty">—</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="setting-group" style="margin:0">
+        <h3>Skip Reasons</h3>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:#888;text-align:left">
+            <th style="padding:4px 6px">Reason</th>
+            <th style="padding:4px 6px;text-align:right">Count</th>
+          </tr></thead>
+          <tbody id="an-skip-body"><tr><td colspan="2" class="empty">—</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="setting-group" style="margin:0">
+        <h3>Confidence Distribution</h3>
+        <div id="an-conf-bars" style="font-size:12px"></div>
+      </div>
+
+    </div>
+
+    <div class="setting-group" style="margin-top:16px">
+      <h3>Signal Log
+        <span style="font-size:11px;font-weight:normal;color:#666;margin-left:8px">
+          most recent 500 — copy rows to share with Claude for model analysis
+        </span>
+      </h3>
+      <div style="overflow-x:auto">
+        <table style="width:100%;font-size:11px;border-collapse:collapse;min-width:900px">
+          <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333">
+            <th style="padding:5px 6px">Time</th>
+            <th style="padding:5px 6px">Sport</th>
+            <th style="padding:5px 6px">Player</th>
+            <th style="padding:5px 6px">Opponent</th>
+            <th style="padding:5px 6px">H/A</th>
+            <th style="padding:5px 6px;text-align:right">Model%</th>
+            <th style="padding:5px 6px;text-align:right">Edge</th>
+            <th style="padding:5px 6px;text-align:right">Ask</th>
+            <th style="padding:5px 6px">Score</th>
+            <th style="padding:5px 6px">Dir</th>
+            <th style="padding:5px 6px">Status</th>
+          </tr></thead>
+          <tbody id="an-sig-body">
+            <tr><td colspan="11" class="empty">No signal data yet — scanner logs signals each cycle.</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -1689,7 +1863,7 @@ HTML = """<!DOCTYPE html>
 let currentTab = 'signals';
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t, i) =>
-    t.classList.toggle('active', ['signals','upcoming','positions','orders','performance','log','settings'][i] === name)
+    t.classList.toggle('active', ['signals','upcoming','positions','orders','performance','analysis','log','settings'][i] === name)
   );
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.getElementById('panel-' + name).classList.add('active');
@@ -1698,6 +1872,7 @@ function showTab(name) {
   if (name === 'positions')    loadPositions();
   if (name === 'orders')       loadOrders();
   if (name === 'performance')  loadPerformance();
+  if (name === 'analysis')     loadAnalysis();
   if (name === 'log')          loadLog();
   if (name === 'settings')     loadNotifyState();
 }
@@ -2435,6 +2610,96 @@ async function loadPerformance() {
   }
 }
 
+// ── Analysis ───────────────────────────────────────────────────────────────
+let analysisMode = 'dry';
+function switchAnalysis(m) {
+  analysisMode = m;
+  document.getElementById('an-btn-dry').classList.toggle('active',  m === 'dry');
+  document.getElementById('an-btn-live').classList.toggle('active', m === 'live');
+  loadAnalysis();
+}
+
+async function loadAnalysis() {
+  try {
+    const d = await fetch('/api/analysis?mode=' + analysisMode).then(r => r.json());
+    const s = d.summary;
+
+    document.getElementById('an-total').textContent    = s.total_signals || '-';
+    document.getElementById('an-buys').textContent     = s.buy_signals   || '-';
+    document.getElementById('an-exec').textContent     = s.executed      || '-';
+    document.getElementById('an-buyrate').textContent  = s.total_signals ? Math.round(s.buy_rate * 100) + '%' : '-';
+    document.getElementById('an-execrate').textContent = s.buy_signals   ? Math.round(s.exec_rate * 100) + '%' : '-';
+    document.getElementById('an-avgedge').textContent  = s.avg_edge ? '+' + Math.round(s.avg_edge * 100) + '%' : '-';
+
+    // Sport breakdown
+    document.getElementById('an-sport-body').innerHTML = Object.entries(d.by_sport).map(([sport, b]) =>
+      `<tr style="border-bottom:1px solid #222">
+        <td style="padding:4px 6px;text-transform:capitalize">${sport}</td>
+        <td style="padding:4px 6px;text-align:right">${b.total}</td>
+        <td style="padding:4px 6px;text-align:right">${b.buys}</td>
+        <td style="padding:4px 6px;text-align:right">${b.executed}</td>
+        <td style="padding:4px 6px;text-align:right;color:#4caf50">${b.avg_edge ? '+' + Math.round(b.avg_edge*100) + '%' : '-'}</td>
+      </tr>`
+    ).join('') || '<tr><td colspan="5" class="empty">—</td></tr>';
+
+    // Skip reasons
+    const skips = Object.entries(d.skip_reasons);
+    document.getElementById('an-skip-body').innerHTML = skips.length
+      ? skips.map(([reason, count]) =>
+          `<tr style="border-bottom:1px solid #222">
+            <td style="padding:4px 6px;color:#aaa;max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${reason}">${reason}</td>
+            <td style="padding:4px 6px;text-align:right">${count}</td>
+          </tr>`
+        ).join('')
+      : '<tr><td colspan="2" class="empty">None</td></tr>';
+
+    // Confidence bars
+    const maxConf = Math.max(...Object.values(d.conf_buckets), 1);
+    document.getElementById('an-conf-bars').innerHTML = Object.entries(d.conf_buckets).map(([lbl, cnt]) => {
+      const pct = Math.round(cnt / maxConf * 100);
+      const cls = lbl === '90+' ? 'green' : lbl === '80-90' ? 'green' : lbl === '70-80' ? 'yellow' : 'dim';
+      return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
+        <span style="width:44px;color:#888">${lbl}%</span>
+        <div style="flex:1;background:#222;border-radius:2px;height:10px">
+          <div style="width:${pct}%;background:${cls==='green'?'#4caf50':cls==='yellow'?'#ff9800':'#555'};height:100%;border-radius:2px"></div>
+        </div>
+        <span style="width:28px;text-align:right;color:#aaa">${cnt}</span>
+      </div>`;
+    }).join('');
+
+    // Signal table
+    const sigs = d.signals || [];
+    document.getElementById('an-sig-body').innerHTML = sigs.length
+      ? sigs.map(s => {
+          const t    = s.ts ? new Date(s.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '-';
+          const mp   = s.model_prob != null ? Math.round(s.model_prob*100)+'%' : '-';
+          const mpCls = s.model_prob >= 0.70 ? 'green' : s.model_prob >= 0.55 ? 'yellow' : 'dim';
+          const edgeStr = s.edge != null ? (s.edge>=0?'+':'')+Math.round(s.edge*100)+'%' : '-';
+          const eCls  = s.edge > 0 ? 'green' : s.edge < 0 ? 'red' : 'dim';
+          const ask   = s.kalshi_ask != null ? Math.round(s.kalshi_ask*100)+'¢' : '-';
+          const ha    = s.home_away ? `<span style="font-size:9px;padding:1px 3px;border-radius:2px;background:${s.home_away==='HOME'?'#1a3a1a':'#3a1a1a'};color:${s.home_away==='HOME'?'#00ff88':'#ff6b6b'}">${s.home_away}</span>` : '-';
+          const dir   = s.direction === 'BUY' ? '<span class="buy">BUY</span>' : '<span class="skip">SKIP</span>';
+          const stat  = s.exec_status || '-';
+          const statCls = stat.includes('dry_run')||stat.includes('executed')||stat.includes('submitted') ? 'green' : stat === 'skipped' ? 'yellow' : 'dim';
+          return `<tr style="border-bottom:1px solid #1a1a1a">
+            <td style="padding:4px 6px;color:#888">${t}</td>
+            <td style="padding:4px 6px;text-transform:capitalize">${s.sport||'-'}</td>
+            <td style="padding:4px 6px">${s.player||'-'}</td>
+            <td style="padding:4px 6px;color:#aaa">${s.opponent||'-'}</td>
+            <td style="padding:4px 6px">${ha}</td>
+            <td style="padding:4px 6px;text-align:right" class="${mpCls}">${mp}</td>
+            <td style="padding:4px 6px;text-align:right" class="${eCls}">${edgeStr}</td>
+            <td style="padding:4px 6px;text-align:right;color:#aaa">${ask}</td>
+            <td style="padding:4px 6px;color:#666;max-width:160px;overflow:hidden;text-overflow:ellipsis" title="${s.score_state||''}">${s.score_state||'-'}</td>
+            <td style="padding:4px 6px">${dir}</td>
+            <td style="padding:4px 6px" class="${statCls}">${stat}</td>
+          </tr>`;
+        }).join('')
+      : '<tr><td colspan="11" class="empty">No signal data yet — scanner logs signals each cycle.</td></tr>';
+
+  } catch(e) { console.error('analysis error', e); }
+}
+
 // ── Polling loop ───────────────────────────────────────────────────────────
 async function poll() {
   await loadStatus();
@@ -2443,6 +2708,7 @@ async function poll() {
   if (currentTab === 'positions')    await loadPositions();
   if (currentTab === 'orders')       await loadOrders();
   if (currentTab === 'performance')  await loadPerformance();
+  if (currentTab === 'analysis')     await loadAnalysis();
   if (currentTab === 'log')          await loadLog();
 }
 
