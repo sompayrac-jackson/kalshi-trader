@@ -306,21 +306,26 @@ def execute_exit(
     entry_cents: int,
     bid_cents: int,
     reason: str,
+    force_live: bool = False,
 ) -> ExitResult:
     """
     Sell an open position at the current bid price.
-    reason : 'stop_loss' or 'profit_take'
+    reason     : 'stop_loss' or 'profit_take'
+    force_live : always execute as a real sell, even when DRY_RUN is True.
+                 Used for real Kalshi positions that need to be exited regardless
+                 of the scanner's current dry-run mode.
     """
     ts      = datetime.now(timezone.utc).isoformat()
     pnl_usd = (bid_cents - entry_cents) * contracts / 100
+    is_dry  = DRY_RUN and not force_live
 
     result = ExitResult(
         ts=ts, ticker=ticker, side=side, contracts=contracts,
         entry_cents=entry_cents, exit_cents=bid_cents,
-        pnl_usd=pnl_usd, reason=reason, dry_run=DRY_RUN,
+        pnl_usd=pnl_usd, reason=reason, dry_run=is_dry,
     )
 
-    if DRY_RUN:
+    if is_dry:
         result.status   = "dry_run"
         result.order_id = f"dry-exit-{uuid.uuid4().hex[:8]}"
         _open_tickers.discard(ticker)

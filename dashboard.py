@@ -240,22 +240,25 @@ def _check_exits(client: KalshiClient):
             except Exception:
                 pass
 
-    # Build entry-price map from appropriate orders file (first logged order per ticker)
+    # Build entry-price map from BOTH order files — live first so real Kalshi
+    # positions always have their correct entry price even when scanner is in
+    # dry-run mode (orders_live.jsonl is authoritative for real positions).
     entry_map: dict[str, dict] = {}
-    if orders_f.exists():
-        for line in orders_f.read_text(encoding="utf-8").splitlines():
-            try:
-                o = json.loads(line)
-                t = o.get("ticker", "")
-                if t and t not in entry_map and o.get("contracts", 0) > 0:
-                    entry_map[t] = {
-                        "entry_cents": o.get("price_cents", 0),
-                        "contracts":   o.get("contracts", 0),
-                        "side":        o.get("side", "yes"),
-                        "edge":        o.get("edge", 0.0),
-                    }
-            except Exception:
-                pass
+    for f in (_orders_file("live"), _orders_file("dry")):
+        if f.exists():
+            for line in f.read_text(encoding="utf-8").splitlines():
+                try:
+                    o = json.loads(line)
+                    t = o.get("ticker", "")
+                    if t and t not in entry_map and o.get("contracts", 0) > 0:
+                        entry_map[t] = {
+                            "entry_cents": o.get("price_cents", 0),
+                            "contracts":   o.get("contracts", 0),
+                            "side":        o.get("side", "yes"),
+                            "edge":        o.get("edge", 0.0),
+                        }
+                except Exception:
+                    pass
 
     # Current signal lookup for model-prob-based PT scaling
     sig_lookup = {s["ticker"]: s for s in _state.get("signals", [])}
@@ -321,11 +324,11 @@ def _check_exits(client: KalshiClient):
 
         if drop >= sl_pct:
             _log(f"[EXIT] {tag}STOP-LOSS {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ drop={drop:.1%} sl={sl_pct:.0%} (cost=${cost_usd:.2f})")
-            r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "stop_loss")
+            r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "stop_loss", force_live=not virtual)
             _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
         elif rise >= pt_pct:
             _log(f"[EXIT] {tag}PROFIT-TAKE {ticker}: entry={entry_cents}¢ bid={bid_cents}¢ rise={rise:.1%} pt={pt_pct:.0%} model={model_prob:.0%} (cost=${cost_usd:.2f})")
-            r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "profit_take")
+            r = executor.execute_exit(client, ticker, side, net_pos, entry_cents, bid_cents, "profit_take", force_live=not virtual)
             _log(f"[EXIT] {r.status} pnl=${r.pnl_usd:.2f} {r.error or ''}")
 
 
@@ -1191,7 +1194,7 @@ def api_performance():
         candidates = [
             o for o in all_orders
             if o.get("contracts", 0) > 0
-            and o.get("status") in ("submitted", "resting", "filled")
+            and o.get("status") in ("submitted", "resting", "filled", "executed")
         ]
 
     # Load exits — these take priority over settlement for resolving orders
