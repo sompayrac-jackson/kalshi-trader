@@ -116,6 +116,7 @@ _state: dict = {
         "stop_loss_pct":         0.35,
         "profit_take_pct":       0.50,
         "min_ask":               0.05,
+        "min_model_prob":        0.0,
         "double_down_enabled":   False,
         "double_down_min_conf":  0.75,
         "double_down_conf_gain": 0.10,
@@ -161,6 +162,7 @@ def _sync_executor_config():
     executor.STOP_LOSS_PCT       = cfg["stop_loss_pct"]
     executor.PROFIT_TAKE_PCT     = cfg["profit_take_pct"]
     executor.MIN_ASK             = cfg["min_ask"]
+    executor.MIN_MODEL_PROB      = float(cfg.get("min_model_prob", 0.0))
     executor.DOUBLE_DOWN_ENABLED    = bool(cfg.get("double_down_enabled", False))
     executor.DOUBLE_DOWN_MIN_CONF   = float(cfg.get("double_down_min_conf", 0.75))
     executor.DOUBLE_DOWN_CONF_GAIN  = float(cfg.get("double_down_conf_gain", 0.10))
@@ -1036,6 +1038,7 @@ _CONFIG_BOUNDS = {
     "stop_loss_pct":          (0.10, 0.60),
     "profit_take_pct":        (0.20, 0.90),
     "min_ask":                (0.02, 0.25),
+    "min_model_prob":         (0.0,  0.95),
     "double_down_min_conf":   (0.55, 0.95),
     "double_down_conf_gain":  (0.05, 0.30),
     "double_down_max_addons": (1,    5),
@@ -1977,6 +1980,16 @@ HTML = """<!DOCTYPE html>
         Skip markets where YES trades below this price — near-zero asks mean the player is nearly eliminated and the market has already priced that in.
       </p>
       <div class="cfg-row">
+        <label>Min Model Prob</label>
+        <input type="range" id="rng-min-model-prob" min="0" max="95" step="5"
+               oninput="showVal('min-model-prob', this.value == 0 ? 'off' : this.value + '%')">
+        <span class="cfg-val" id="val-min-model-prob">off</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:8px">
+        Skip entries where model confidence is below this threshold, regardless of edge.
+        Set to 0 to disable. Calibration data suggests 75–80%+ is the reliable zone.
+      </p>
+      <div class="cfg-row">
         <label>Max Bet (USD)</label>
         <input type="range" id="rng-max-bet" min="5" max="200" step="5"
                oninput="showVal('max-bet', '$'+this.value)">
@@ -2209,6 +2222,8 @@ function syncSliders(cfg) {
            Math.round((cfg.profit_take_pct || 0.50) * 100) + '%');
   setValue('min-ask', Math.round((cfg.min_ask || 0.05) * 100),
            Math.round((cfg.min_ask || 0.05) * 100) + '¢');
+  const mmp = Math.round((cfg.min_model_prob || 0) * 100);
+  setValue('min-model-prob', mmp, mmp === 0 ? 'off' : mmp + '%');
   const arbH = Math.max(1, Math.round(cfg.arb_interval_sec / 3600));
   setValue('arb-int', arbH, arbH + 'h');
   // Double Down
@@ -2664,6 +2679,7 @@ async function saveConfig() {
     stop_loss_pct:     parseFloat(document.getElementById('rng-stop-loss').value) / 100,
     profit_take_pct:   parseFloat(document.getElementById('rng-profit-take').value) / 100,
     min_ask:           parseFloat(document.getElementById('rng-min-ask').value) / 100,
+    min_model_prob:    parseFloat(document.getElementById('rng-min-model-prob').value) / 100,
     double_down_min_conf:   parseFloat(document.getElementById('rng-dd-min-conf').value) / 100,
     double_down_conf_gain:  parseFloat(document.getElementById('rng-dd-conf-gain').value) / 100,
     double_down_max_addons: parseFloat(document.getElementById('rng-dd-max-addons').value),

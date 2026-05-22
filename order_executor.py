@@ -30,6 +30,7 @@ MIN_ASK     = 0.05    # skip if market prices YES below this — near-zero asks 
 
 STOP_LOSS_PCT   = 0.35   # sell if bid drops this fraction below entry price
 PROFIT_TAKE_PCT = 0.50   # sell if bid rises this fraction above entry price
+MIN_MODEL_PROB  = 0.0    # skip entries where model_prob is below this (0 = disabled)
 
 # ── Double Down Config ────────────────────────────────────────────────────────
 DOUBLE_DOWN_ENABLED    = False  # off by default — explicitly enabled via dashboard
@@ -283,6 +284,13 @@ def execute_live(client: KalshiClient, signal: LiveSignal) -> OrderResult:
             signal.ticker, signal.player, "yes",
             signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
             "model says overpriced — no trade",
+        )
+    if MIN_MODEL_PROB > 0 and signal.model_prob < MIN_MODEL_PROB:
+        return _skip(
+            datetime.now(timezone.utc).isoformat(),
+            signal.ticker, signal.player, "yes",
+            signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
+            f"model_prob {signal.model_prob:.2f} below min {MIN_MODEL_PROB:.2f}",
         )
     return execute(
         client=client,
