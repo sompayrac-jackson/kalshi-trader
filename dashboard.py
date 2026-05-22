@@ -1288,7 +1288,7 @@ def api_performance():
     return jsonify({
         "mode": mode,
         "summary": {
-            "total_bets": len(virtual),
+            "total_bets": len(candidates),
             "resolved":   n,
             "pending":            len(pending_orders),
             "wins":               wins,
