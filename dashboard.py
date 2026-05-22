@@ -11,6 +11,7 @@ Usage:
 
 import hmac
 import json
+import re
 import threading
 import time
 import argparse
@@ -45,6 +46,7 @@ PERF_CACHE_DRY    = Path("perf_cache_dry.json")
 PERF_CACHE_LIVE   = Path("perf_cache_live.json")
 SIGNALS_DRY_FILE  = Path("signals_dry.jsonl")
 SIGNALS_LIVE_FILE = Path("signals_live.jsonl")
+PRICE_HISTORY_FILE = Path("price_history.jsonl")
 
 def _orders_file(mode: str) -> Path:
     return ORDERS_LIVE_FILE if mode == "live" else ORDERS_DRY_FILE
@@ -410,6 +412,47 @@ def _check_double_downs(client: KalshiClient):
             _log(f"[DD] execute_addon error {ticker}: {e}")
 
 
+def _parse_period(score_state: str, sport: str) -> str:
+    """Return a canonical period label from score_state, e.g. 'Inning 4' or 'Set 2'."""
+    if sport == "baseball":
+        m = re.match(r'(Top|Bot)\s+(\d+)', score_state or "", re.IGNORECASE)
+        if m:
+            return f"{'Top' if m.group(1).lower() == 'top' else 'Bot'} {m.group(2)}"
+    elif sport == "tennis":
+        m = re.match(r'(\d+)-(\d+)\s+sets', score_state or "", re.IGNORECASE)
+        if m:
+            completed = int(m.group(1)) + int(m.group(2))
+            return f"Set {completed + 1}"
+    return "Unknown"
+
+
+def _log_price_history():
+    """Append current cached bid prices for open live positions to price_history.jsonl."""
+    with _price_lock:
+        cache = dict(_price_cache)
+    if not cache:
+        return
+    ts = datetime.now(timezone.utc).isoformat()
+    player_map: dict[str, str] = {}
+    if ORDERS_LIVE_FILE.exists():
+        for line in ORDERS_LIVE_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                o = json.loads(line)
+                t = o.get("ticker", "")
+                if t and t not in player_map:
+                    player_map[t] = o.get("player", "")
+            except Exception:
+                pass
+    with PRICE_HISTORY_FILE.open("a", encoding="utf-8") as fh:
+        for ticker, bid_dollars in cache.items():
+            fh.write(json.dumps({
+                "ts":        ts,
+                "ticker":    ticker,
+                "player":    player_map.get(ticker, ""),
+                "bid_cents": round(bid_dollars * 100),
+            }) + "\n")
+
+
 def _scanner_loop():
     global _client
     _client  = KalshiClient(api_key_id=KALSHI_API_KEY)
@@ -489,6 +532,9 @@ def _scanner_loop():
                     pass
             with _price_lock:
                 _price_cache.update(fresh)
+
+        # Log price history for all tracked open positions
+        _log_price_history()
 
         # Exit check — runs every cycle after live scan
         try:
@@ -677,6 +723,7 @@ _ALL_LOG_FILES = (
     EXITS_DRY_FILE,   EXITS_LIVE_FILE,
     PERF_CACHE_DRY,   PERF_CACHE_LIVE,
     SIGNALS_DRY_FILE, SIGNALS_LIVE_FILE,
+    PRICE_HISTORY_FILE,
 )
 
 
@@ -745,7 +792,7 @@ def api_logs_archive():
     ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     moved = []
     targets = _ALL_LOG_FILES if mode == "all" else (
-        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode), _signals_file(mode))
+        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode), _signals_file(mode), PRICE_HISTORY_FILE)
     )
     for f in targets:
         if f.exists():
@@ -761,7 +808,7 @@ def api_logs_archive():
 def api_logs_clear():
     mode = request.get_json(silent=True, force=True).get("mode", "all") if request.data else "all"
     targets = _ALL_LOG_FILES if mode == "all" else (
-        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode), _signals_file(mode))
+        (_orders_file(mode), _exits_file(mode), _perf_cache_file(mode), _signals_file(mode), PRICE_HISTORY_FILE)
     )
     for f in targets:
         if f.exists():
@@ -833,6 +880,74 @@ def api_analysis():
     avg_edge  = round(sum(edge_vals) / len(edge_vals), 4) if edge_vals else 0
     max_edge  = round(max(edge_vals), 4) if edge_vals else 0
 
+    # Load settlement cache for timing + missed-trades join
+    perf_cache = _load_perf_cache(mode)
+
+    # Entry timing: group first exec'd signal per ticker by game period
+    executed_first: dict[str, dict] = {}
+    for s in sigs:
+        if s.get("exec_status") not in ("dry_run", "submitted", "resting", "executed"):
+            continue
+        t = s.get("ticker", "")
+        if t and t not in executed_first:
+            executed_first[t] = s
+
+    timing_map: dict[str, dict] = {}
+    for s in executed_first.values():
+        period = _parse_period(s.get("score_state", ""), s.get("sport", ""))
+        result = perf_cache.get(s.get("ticker", ""))
+        won    = (result == "yes") if result else None
+        b = timing_map.setdefault(period, {
+            "period": period, "count": 0, "wins": 0, "settled": 0,
+            "avg_edge": 0.0, "_edge_sum": 0.0,
+        })
+        b["count"] += 1
+        b["_edge_sum"] += float(s.get("edge", 0))
+        if won is not None:
+            b["settled"] += 1
+            b["wins"] += int(won)
+    for b in timing_map.values():
+        b["avg_edge"] = round(b["_edge_sum"] / b["count"], 3) if b["count"] else 0
+        b["win_rate"] = round(b["wins"] / b["settled"], 3) if b["settled"] else None
+        del b["_edge_sum"]
+
+    def _period_sort_key(p: str) -> tuple:
+        half = 0 if p.startswith("Top") or p.startswith("Set") else 1
+        m = re.search(r'(\d+)', p)
+        return (int(m.group(1)) if m else 99, half)
+
+    timing = sorted(timing_map.values(), key=lambda b: _period_sort_key(b["period"]))
+
+    # Missed trades: positive-edge buy signals skipped for reasons other than "already holding"
+    missed_map: dict[str, dict] = {}
+    for s in sigs:
+        if float(s.get("edge", 0)) <= 0:
+            continue
+        if s.get("exec_status") in ("dry_run", "submitted", "resting", "executed"):
+            continue
+        err = (s.get("exec_error") or s.get("exec_status") or "").strip()
+        if "already holding" in err:
+            continue
+        t = s.get("ticker", "")
+        if not t:
+            continue
+        if t not in missed_map:
+            missed_map[t] = {
+                "ticker":     t,
+                "player":     s.get("player", ""),
+                "sport":      s.get("sport", ""),
+                "ts":         s.get("ts", ""),
+                "kalshi_ask": round(float(s.get("kalshi_ask", 0)), 2),
+                "model_prob": round(float(s.get("model_prob", 0)), 3),
+                "edge":       round(float(s.get("edge", 0)), 3),
+                "kelly_usd":  round(float(s.get("kelly_usd", 0)), 2),
+                "reason":     err,
+                "skip_count": 0,
+                "settlement": perf_cache.get(t),
+            }
+        missed_map[t]["skip_count"] += 1
+    missed_trades = sorted(missed_map.values(), key=lambda x: -float(x["kelly_usd"]))[:50]
+
     return jsonify({
         "summary": {
             "total_signals":   total,
@@ -846,8 +961,37 @@ def api_analysis():
         "by_sport":    by_sport,
         "skip_reasons": dict(sorted(skip_reasons.items(), key=lambda x: -x[1])),
         "conf_buckets": buckets,
+        "timing":      timing,
+        "missed_trades": missed_trades,
         "signals":     list(reversed(sigs[-500:])),
     })
+
+
+@app.route("/api/price_history")
+@_require_auth
+def api_price_history():
+    ticker = request.args.get("ticker", "")
+    entries: list[dict] = []
+    if PRICE_HISTORY_FILE.exists():
+        for line in PRICE_HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                e = json.loads(line)
+                if not ticker or e.get("ticker") == ticker:
+                    entries.append(e)
+            except Exception:
+                pass
+    if ticker:
+        return jsonify(entries[-500:])
+    # No ticker: group by ticker for sparkline summary
+    by_ticker: dict[str, dict] = {}
+    for e in entries:
+        t = e.get("ticker", "")
+        if not t:
+            continue
+        if t not in by_ticker:
+            by_ticker[t] = {"ticker": t, "player": e.get("player", ""), "points": [], "first_ts": e.get("ts", "")}
+        by_ticker[t]["points"].append(e.get("bid_cents", 0))
+    return jsonify(list(by_ticker.values()))
 
 
 @app.route("/api/start", methods=["POST"])
@@ -1288,6 +1432,53 @@ def api_performance():
         b["wins"] += int(o["won"])
         b["pnl"]  += o["pnl"]
 
+    # Model calibration: stated model_prob at entry vs actual win rate
+    model_prob_map: dict[str, float] = {}
+    sig_f = _signals_file(mode)
+    if sig_f.exists():
+        for line in sig_f.read_text(encoding="utf-8").splitlines():
+            try:
+                s = json.loads(line)
+                t = s.get("ticker", "")
+                if t and t not in model_prob_map and s.get("exec_status") in (
+                        "dry_run", "submitted", "resting", "executed"):
+                    model_prob_map[t] = float(s.get("model_prob", 0))
+            except Exception:
+                pass
+
+    _CAL_LABELS = ["50-55", "55-60", "60-65", "65-70", "70-75",
+                   "75-80", "80-85", "85-90", "90-95", "95+"]
+    _cal: dict[str, dict] = {lb: {"count": 0, "wins": 0, "_s": 0.0} for lb in _CAL_LABELS}
+    for o in resolved_orders:
+        mp = model_prob_map.get(o.get("ticker", ""))
+        if mp is None:
+            continue
+        p = mp * 100
+        if   p < 50: continue
+        elif p < 55: lb = "50-55"
+        elif p < 60: lb = "55-60"
+        elif p < 65: lb = "60-65"
+        elif p < 70: lb = "65-70"
+        elif p < 75: lb = "70-75"
+        elif p < 80: lb = "75-80"
+        elif p < 85: lb = "80-85"
+        elif p < 90: lb = "85-90"
+        elif p < 95: lb = "90-95"
+        else:        lb = "95+"
+        _cal[lb]["count"] += 1
+        _cal[lb]["wins"]  += int(o["won"])
+        _cal[lb]["_s"]    += mp
+    calibration = []
+    for lb in _CAL_LABELS:
+        b = _cal[lb]
+        if b["count"]:
+            calibration.append({
+                "label":           lb + "%",
+                "count":           b["count"],
+                "avg_model_prob":  round(b["_s"] / b["count"], 3),
+                "actual_win_rate": round(b["wins"] / b["count"], 3),
+            })
+
     return jsonify({
         "mode": mode,
         "summary": {
@@ -1302,6 +1493,7 @@ def api_performance():
             "roi":                round(total_pnl / total_cost, 3) if total_cost else 0,
         },
         "edge_buckets": buckets,
+        "calibration": calibration,
         "resolved":  sorted(resolved_orders, key=lambda x: x["ts"], reverse=True)[:100],
         "pending":   sorted(pending_orders,  key=lambda x: x["ts"], reverse=True)[:50],
     })
@@ -1456,6 +1648,16 @@ HTML = """<!DOCTYPE html>
   .fix-date{font-size:10px;color:#444;margin-top:2px}
   .fix-sport-icon{font-size:15px;margin-right:4px}
   .no-upcoming{color:#444;text-align:center;padding:40px;font-size:12px}
+
+  /* Calibration chart */
+  .cal-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:11px}
+  .cal-label{width:55px;color:#666;text-align:right;flex-shrink:0}
+  .cal-bars{flex:1;position:relative;height:18px;background:#111;border-radius:3px;overflow:hidden}
+  .cal-bar-expected{position:absolute;height:100%;background:#1a3a1a;border-radius:3px}
+  .cal-bar-actual{position:absolute;height:100%;background:#00ff88;opacity:.8;border-radius:3px;top:0}
+  .cal-stat{width:80px;font-size:10px;color:#666;flex-shrink:0}
+  /* Sparkline */
+  .spark{display:inline-block;vertical-align:middle}
 </style>
 </head>
 <body>
@@ -1572,7 +1774,8 @@ HTML = """<!DOCTYPE html>
           <th title="Current yes_bid from last scan">Current</th>
           <th title="Stop-loss ↓ / Profit-take ↑ trigger prices">SL↓ / PT↑</th>
           <th title="Model win probability (current if scanner active, entry estimate otherwise)">Conf</th>
-          <th>Status</th><th>Src</th><th title="ESPN link">ESPN</th><th></th>
+          <th>Status</th><th>Src</th><th title="ESPN link">ESPN</th>
+          <th title="Bid price history sparkline">Price Path</th><th></th>
         </tr></thead>
         <tbody id="ord-body"></tbody>
       </table>
@@ -1595,6 +1798,16 @@ HTML = """<!DOCTYPE html>
 
     <div style="margin:20px 0 8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.08em">Edge Bucket Analysis</div>
     <div id="perf-buckets" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px"></div>
+
+    <!-- Model Calibration -->
+    <div class="setting-group" style="margin-top:16px">
+      <h3>Model Calibration
+        <span style="font-size:11px;font-weight:normal;color:#666;margin-left:8px">
+          green bar = actual win rate &nbsp;|&nbsp; dark bar = model probability (expected)
+        </span>
+      </h3>
+      <div id="perf-cal-body"><div class="dim" style="font-size:12px;padding:8px 0">No resolved trades with signal data yet.</div></div>
+    </div>
 
     <div style="margin-bottom:8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.08em">
       Resolved Bets <span style="color:#555" id="pf-pending-note"></span>
@@ -1658,6 +1871,45 @@ HTML = """<!DOCTYPE html>
         <div id="an-conf-bars" style="font-size:12px"></div>
       </div>
 
+    </div>
+
+    <!-- Entry Timing -->
+    <div class="setting-group" style="margin-top:16px">
+      <h3>Entry Timing — Win Rate by Game Period</h3>
+      <div style="overflow-x:auto">
+        <table style="width:100%;font-size:12px;border-collapse:collapse;min-width:500px">
+          <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333">
+            <th style="padding:5px 8px">Period</th>
+            <th style="padding:5px 8px;text-align:right">Entries</th>
+            <th style="padding:5px 8px;text-align:right">Avg Edge</th>
+            <th style="padding:5px 8px;text-align:right">Settled</th>
+            <th style="padding:5px 8px;text-align:right">Win Rate</th>
+            <th style="padding:5px 8px">Win Bar</th>
+          </tr></thead>
+          <tbody id="an-timing-body"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Missed Trades -->
+    <div class="setting-group" style="margin-top:16px">
+      <h3>Missed Trades — Skipped Opportunities with Positive Edge</h3>
+      <div style="overflow-x:auto">
+        <table style="width:100%;font-size:12px;border-collapse:collapse;min-width:700px">
+          <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333">
+            <th style="padding:5px 8px">Player</th>
+            <th style="padding:5px 8px">Sport</th>
+            <th style="padding:5px 8px;text-align:right">Ask</th>
+            <th style="padding:5px 8px;text-align:right">Model%</th>
+            <th style="padding:5px 8px;text-align:right">Edge</th>
+            <th style="padding:5px 8px;text-align:right">Kelly$</th>
+            <th style="padding:5px 8px;text-align:right">Skips</th>
+            <th style="padding:5px 8px">Reason</th>
+            <th style="padding:5px 8px">Settled</th>
+          </tr></thead>
+          <tbody id="an-missed-body"><tr><td colspan="9" class="empty">Loading...</td></tr></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="setting-group" style="margin-top:16px">
@@ -1862,6 +2114,22 @@ HTML = """<!DOCTYPE html>
 </div><!-- /content -->
 
 <script>
+// ── Sparkline helper ───────────────────────────────────────────────────────
+function sparkSvg(points, entryVal) {
+  if (!points || points.length < 2) return '<span class="dim" style="font-size:10px">—</span>';
+  const mn = Math.min(...points), mx = Math.max(...points, entryVal || 0);
+  const range = mx - mn || 1;
+  const w = 70, h = 20, pad = 2;
+  const xs = points.map((_, i) => pad + (i / (points.length - 1)) * (w - pad*2));
+  const ys = points.map(v => h - pad - ((v - mn) / range) * (h - pad*2));
+  const line = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ');
+  const lastColor = points[points.length-1] >= (entryVal||0) ? '#00ff88' : '#ff6b6b';
+  return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+    <polyline points="${line}" fill="none" stroke="${lastColor}" stroke-width="1.5" stroke-linejoin="round"/>
+    ${entryVal ? `<line x1="${pad}" y1="${(h - pad - ((entryVal - mn) / range) * (h - pad*2)).toFixed(1)}" x2="${w-pad}" y2="${(h - pad - ((entryVal - mn) / range) * (h - pad*2)).toFixed(1)}" stroke="#444" stroke-width="1" stroke-dasharray="2,2"/>` : ''}
+  </svg>`;
+}
+
 // ── Tab switching ──────────────────────────────────────────────────────────
 let currentTab = 'signals';
 function showTab(name) {
@@ -2188,10 +2456,19 @@ function espnUrl(ticker, player) {
 
 async function loadOrders() {
   try {
-    const os = await fetch('/api/orders?mode=' + ordersMode).then(r => r.json());
+    const [os, phRaw] = await Promise.all([
+      fetch('/api/orders?mode=' + ordersMode).then(r => r.json()),
+      fetch('/api/price_history').then(r => r.json()).catch(() => []),
+    ]);
+    // Build sparkline lookup: ticker -> {points, player}
+    const sparkLookup = {};
+    (phRaw || []).forEach(item => {
+      if (item.ticker) sparkLookup[item.ticker] = item;
+    });
+
     const tbody = document.getElementById('ord-body');
     if (!os.length) {
-      tbody.innerHTML = '<tr><td colspan="14" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="15" class="empty">No ' + (ordersMode === 'live' ? 'live' : 'paper') + ' orders logged yet</td></tr>';
       return;
     }
     tbody.innerHTML = os.map(o => {
@@ -2223,6 +2500,10 @@ async function loadOrders() {
              onclick="sellNow('${o.ticker}','${o.side||'yes'}',${o.contracts},${entry})">Sell</button></td>`
         : '<td></td>';
 
+      // Price path sparkline
+      const sparkData = sparkLookup[o.ticker];
+      const sparkCell = `<td style="padding:5px 8px">${sparkSvg(sparkData ? sparkData.points : null, entry || null)}</td>`;
+
       return `<tr>
         <td class="dim" style="font-size:11px">${fmtTime(o.ts)}</td>
         <td>${o.player}</td>
@@ -2237,6 +2518,7 @@ async function loadOrders() {
         <td><span class="st ${o.status}">${o.status}</span></td>
         <td><span class="src ${o.source}">${o.source}</span></td>
         ${espnCell}
+        ${sparkCell}
         ${sellBtn}
       </tr>`;
     }).join('');
@@ -2586,6 +2868,29 @@ async function loadPerformance() {
       </div>`;
     }).join('');
 
+    // Calibration chart
+    const cal = d.calibration || [];
+    const calDiv = document.getElementById('perf-cal-body');
+    if (cal.length === 0) {
+      calDiv.innerHTML = '<div class="dim" style="font-size:12px;padding:8px 0">No resolved trades with signal data yet.</div>';
+    } else {
+      calDiv.innerHTML = cal.map(b => {
+        const exp = (b.avg_model_prob * 100).toFixed(0);
+        const act = (b.actual_win_rate * 100).toFixed(0);
+        const diff = b.actual_win_rate - b.avg_model_prob;
+        const diffStr = diff >= 0 ? `<span class="green">+${(diff*100).toFixed(0)}%</span>` : `<span class="red">${(diff*100).toFixed(0)}%</span>`;
+        return `<div class="cal-row">
+          <div class="cal-label">${b.label}</div>
+          <div class="cal-bars">
+            <div class="cal-bar-expected" style="width:${exp}%"></div>
+            <div class="cal-bar-actual"   style="width:${act}%"></div>
+          </div>
+          <div class="cal-stat">n=${b.count} &nbsp; actual=${act}%</div>
+          <div style="font-size:10px;width:50px">${diffStr}</div>
+        </div>`;
+      }).join('');
+    }
+
     // Resolved table
     const tbody = document.getElementById('perf-body');
     if (!d.resolved.length) {
@@ -2699,6 +3004,51 @@ async function loadAnalysis() {
           </tr>`;
         }).join('')
       : '<tr><td colspan="11" class="empty">No signal data yet — scanner logs signals each cycle.</td></tr>';
+
+    // Timing table
+    const timing = d.timing || [];
+    const tbody_t = document.getElementById('an-timing-body');
+    if (timing.length === 0) {
+      tbody_t.innerHTML = '<tr><td colspan="6" class="empty dim">Not enough data yet</td></tr>';
+    } else {
+      tbody_t.innerHTML = timing.map(b => {
+        const wr = b.win_rate != null ? (b.win_rate * 100).toFixed(0) + '%' : '—';
+        const wrColor = b.win_rate == null ? '' : b.win_rate >= 0.55 ? 'color:#00ff88' : b.win_rate >= 0.45 ? 'color:#ffcc00' : 'color:#ff6b6b';
+        const bar = b.win_rate != null
+          ? `<div style="height:10px;background:#1a3a1a;border-radius:3px;overflow:hidden;width:120px;display:inline-block"><div style="height:100%;width:${(b.win_rate*100).toFixed(0)}%;background:#00ff88;opacity:.8"></div></div>`
+          : '';
+        return `<tr>
+          <td style="padding:5px 8px;font-weight:bold">${b.period}</td>
+          <td style="padding:5px 8px;text-align:right">${b.count}</td>
+          <td style="padding:5px 8px;text-align:right;color:#ffcc00">${(b.avg_edge*100).toFixed(1)}%</td>
+          <td style="padding:5px 8px;text-align:right">${b.settled}</td>
+          <td style="padding:5px 8px;text-align:right;${wrColor}">${wr}</td>
+          <td style="padding:5px 8px">${bar}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // Missed trades table
+    const missed = d.missed_trades || [];
+    const tbody_m = document.getElementById('an-missed-body');
+    if (missed.length === 0) {
+      tbody_m.innerHTML = '<tr><td colspan="9" class="empty dim">No missed trades with positive edge</td></tr>';
+    } else {
+      tbody_m.innerHTML = missed.map(t => {
+        const sett = t.settlement ? `<span class="${t.settlement === 'yes' ? 'green' : 'red'}">${t.settlement.toUpperCase()}</span>` : '<span class="dim">pending</span>';
+        return `<tr>
+          <td style="padding:5px 8px">${t.player}</td>
+          <td style="padding:5px 8px">${t.sport}</td>
+          <td style="padding:5px 8px;text-align:right">${(t.kalshi_ask*100).toFixed(0)}¢</td>
+          <td style="padding:5px 8px;text-align:right">${(t.model_prob*100).toFixed(0)}%</td>
+          <td style="padding:5px 8px;text-align:right;color:#00ff88">+${(t.edge*100).toFixed(1)}%</td>
+          <td style="padding:5px 8px;text-align:right">$${t.kelly_usd.toFixed(2)}</td>
+          <td style="padding:5px 8px;text-align:right;color:#555">${t.skip_count}</td>
+          <td style="padding:5px 8px;color:#666;font-size:11px">${t.reason}</td>
+          <td style="padding:5px 8px">${sett}</td>
+        </tr>`;
+      }).join('');
+    }
 
   } catch(e) { console.error('analysis error', e); }
 }
