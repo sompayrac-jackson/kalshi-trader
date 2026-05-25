@@ -273,7 +273,7 @@ def _check_exits(client: KalshiClient):
 
     for pos in to_check:
         ticker   = pos.get("ticker", "")
-        net_pos  = pos.get("position", 0)
+        net_pos  = int(float(pos.get("position_fp") or pos.get("position") or 0))
         virtual  = pos.get("_virtual", False)
 
         if net_pos <= 0:
