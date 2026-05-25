@@ -102,13 +102,13 @@ _client: KalshiClient | None = None
 
 _state: dict = {
     "running":        False,
-    "dry_run":        True,
+    "dry_run":        False,
     "last_live_scan": None,
     "last_arb_scan":  None,
     "signals":        [],
     "log":            [],
     "config": {
-        "min_edge":              0.04,
+        "min_edge":              0.10,
         "max_bet_usd":           25.0,
         "kelly_fraction":        0.5,
         "arb_interval_sec":      300,
@@ -116,7 +116,7 @@ _state: dict = {
         "stop_loss_pct":         0.35,
         "profit_take_pct":       0.50,
         "min_ask":               0.05,
-        "min_model_prob":        0.0,
+        "min_model_prob":        0.65,
         "double_down_enabled":   False,
         "double_down_min_conf":  0.75,
         "double_down_conf_gain": 0.10,
@@ -3123,12 +3123,12 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0")
     args = parser.parse_args()
 
-    # Auto-start scanner in dry-run mode at startup
+    # Auto-start scanner in live mode at startup
     _state["running"] = True
-    _state["dry_run"] = True
+    _state["dry_run"] = False
     _scan_thread = threading.Thread(target=_scanner_loop, daemon=True, name="scanner")
     _scan_thread.start()
-    print("Scanner auto-started in DRY RUN mode")
+    print("Scanner auto-started in LIVE mode")
 
     print(f"Dashboard running at http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
