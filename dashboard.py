@@ -196,22 +196,29 @@ def _model_pt_scale(model_prob: float) -> float:
     return 1.0 + confidence * 4.0
 
 
-def _check_exits(client: KalshiClient):
+def _check_exits(client: KalshiClient, live_positions: list[dict] | None = None):
     """
     Scan open positions (real in live mode, virtual from orders.jsonl in dry-run)
     and trigger stop-loss or profit-take sells when thresholds are breached.
+
+    live_positions: pre-fetched from Kalshi by the scanner loop (avoids a redundant
+    get_positions() call here). Pass None only when calling outside the scanner loop.
     """
     cfg             = _state["config"]
     stop_loss_pct   = cfg["stop_loss_pct"]
     profit_take_pct = cfg["profit_take_pct"]
     dry_run         = _state["dry_run"]
 
-    # Real positions from Kalshi
-    real_positions: list[dict] = []
-    try:
-        real_positions = client.get_positions().get("market_positions", [])
-    except Exception as e:
-        _log(f"[EXIT] positions fetch failed: {e}")
+    # Real positions: use the pre-fetched list when available, else fetch now.
+    if live_positions is not None:
+        real_positions = live_positions
+    else:
+        real_positions = []
+        if not dry_run:
+            try:
+                real_positions = client.get_positions().get("market_positions", [])
+            except Exception as e:
+                _log(f"[EXIT] positions fetch failed: {e}")
 
     # Virtual positions in dry-run: orders_dry.jsonl entries not yet in exits_dry.jsonl
     virtual_positions: list[dict] = []
@@ -310,13 +317,9 @@ def _check_exits(client: KalshiClient):
             model_prob = max(0.5, min(0.99, model_prob))
         pt_pct = pt_pct * _model_pt_scale(model_prob)
 
-        try:
-            market      = client.get_market(ticker)
-            bid_dollars = float(market.get("yes_bid_dollars") or 0)
-            bid_cents   = round(bid_dollars * 100)
-        except Exception as e:
-            _log(f"[EXIT] market fetch failed {ticker}: {e}")
-            continue
+        with _price_lock:
+            bid_dollars = _price_cache.get(ticker, 0.0)
+        bid_cents = round(bid_dollars * 100)
 
         if bid_cents <= 0:
             continue
@@ -521,7 +524,31 @@ def _scanner_loop():
         except Exception as e:
             _log(f"Live scan error: {e}")
 
-        # Refresh bid price cache for all open tickers (used by Orders tab)
+        # Fetch live positions once per cycle (live mode only) — shared with exit
+        # checks and used to prune stale tickers from _open_tickers so we don't
+        # keep calling get_market() for positions Kalshi has already settled.
+        live_positions: list[dict] = []
+        if not _state["dry_run"]:
+            try:
+                live_positions = _client.get_positions().get("market_positions", [])
+                active_on_kalshi = {
+                    p["ticker"] for p in live_positions
+                    if int(float(p.get("position_fp") or p.get("position") or 0)) > 0
+                }
+                stale = {t for t in executor._open_tickers if t not in active_on_kalshi}
+                if stale:
+                    _log(f"[POSITIONS] pruning {len(stale)} settled tickers: {stale}")
+                    executor._open_tickers -= stale
+                    for t in stale:
+                        executor._addon_counts.pop(t, None)
+                        executor._position_cost.pop(t, None)
+                    with _price_lock:
+                        for t in stale:
+                            _price_cache.pop(t, None)
+            except Exception as e:
+                _log(f"[POSITIONS] fetch failed: {e}")
+
+        # Refresh bid price cache for open tickers (used by Orders tab + exit checks)
         if executor._open_tickers:
             fresh: dict[str, float] = {}
             for ticker in list(executor._open_tickers):
@@ -538,9 +565,9 @@ def _scanner_loop():
         # Log price history for all tracked open positions
         _log_price_history()
 
-        # Exit check — runs every cycle after live scan
+        # Exit check — reuses pre-fetched positions, reads bid from _price_cache
         try:
-            _check_exits(_client)
+            _check_exits(_client, live_positions)
         except Exception as e:
             _log(f"[EXIT] check error: {e}")
 
