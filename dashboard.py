@@ -254,6 +254,8 @@ def _check_exits(client: KalshiClient, live_positions: list[dict] | None = None)
     # Build entry-price map from BOTH order files — live first so real Kalshi
     # positions always have their correct entry price even when scanner is in
     # dry-run mode (orders_live.jsonl is authoritative for real positions).
+    # Use the MOST RECENT non-addon base order per ticker so that re-entries
+    # after a stop-loss use the new entry price, not the old one.
     entry_map: dict[str, dict] = {}
     for f in (_orders_file("live"), _orders_file("dry")):
         if f.exists():
@@ -261,7 +263,11 @@ def _check_exits(client: KalshiClient, live_positions: list[dict] | None = None)
                 try:
                     o = json.loads(line)
                     t = o.get("ticker", "")
-                    if t and t not in entry_map and o.get("contracts", 0) > 0:
+                    if not t or o.get("contracts", 0) <= 0:
+                        continue
+                    # Only track base (non-addon) orders for entry price reference.
+                    # Always overwrite so the most recent base order wins.
+                    if not o.get("is_addon"):
                         entry_map[t] = {
                             "entry_cents": o.get("price_cents", 0),
                             "contracts":   o.get("contracts", 0),
@@ -284,6 +290,13 @@ def _check_exits(client: KalshiClient, live_positions: list[dict] | None = None)
         virtual  = pos.get("_virtual", False)
 
         if net_pos <= 0:
+            continue
+
+        # For real positions: skip if we've already exited this ticker locally.
+        # execute_exit() removes from _open_tickers immediately. Without this guard
+        # the sell order sits "resting" on Kalshi and get_positions() keeps returning
+        # it, causing the exit to re-fire every scan cycle until the order settles.
+        if not virtual and ticker not in executor._open_tickers:
             continue
 
         # Get entry price — virtual positions carry it directly; real ones come from entry_map
