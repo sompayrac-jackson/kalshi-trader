@@ -1028,7 +1028,7 @@ def api_price_history():
 def api_start():
     global _scan_thread
     data    = request.get_json(silent=True) or {}
-    dry_run = data.get("dry_run", True)
+    dry_run = data.get("dry_run", False)
 
     with _lock:
         if _state["running"]:
@@ -1982,8 +1982,8 @@ HTML = """<!DOCTYPE html>
     <div class="setting-group">
       <h3>Scanner Control</h3>
       <div class="controls">
-        <button class="btn btn-green" id="btn-start"     onclick="startScanner(false)">Start (Dry Run)</button>
         <button class="btn btn-orange" id="btn-start-live" onclick="startScanner(true)">Start LIVE</button>
+        <button class="btn btn-green" id="btn-start"     onclick="startScanner(false)">Start (Dry Run)</button>
         <button class="btn btn-red"   id="btn-stop"      onclick="stopScanner()">Stop</button>
       </div>
       <p style="font-size:11px;color:#555">LIVE mode places real orders. Confirm twice before enabling.</p>
