@@ -46,7 +46,8 @@ PERF_CACHE_DRY    = Path("perf_cache_dry.json")
 PERF_CACHE_LIVE   = Path("perf_cache_live.json")
 SIGNALS_DRY_FILE  = Path("signals_dry.jsonl")
 SIGNALS_LIVE_FILE = Path("signals_live.jsonl")
-PRICE_HISTORY_FILE = Path("price_history.jsonl")
+PRICE_HISTORY_FILE    = Path("price_history.jsonl")
+PORTFOLIO_SNAP_FILE   = Path("portfolio_snapshots.jsonl")
 
 def _orders_file(mode: str) -> Path:
     return ORDERS_LIVE_FILE if mode == "live" else ORDERS_DRY_FILE
@@ -471,6 +472,32 @@ def _log_price_history():
             }) + "\n")
 
 
+def _log_portfolio_snapshot(cash_usd: float, live_positions: list[dict]):
+    """Write one portfolio value snapshot per scan cycle to portfolio_snapshots.jsonl.
+
+    Unrealized value = sum(bid_price × net_contracts) for all open Kalshi positions.
+    Uses the refreshed _price_cache so this must run after the cache update.
+    """
+    with _price_lock:
+        cache = dict(_price_cache)
+
+    unrealized = 0.0
+    for pos in live_positions:
+        ticker = pos.get("ticker", "")
+        net    = int(float(pos.get("position_fp") or pos.get("position") or 0))
+        if net > 0 and ticker in cache:
+            unrealized += cache[ticker] * net
+
+    total = round(cash_usd + unrealized, 2)
+    with PORTFOLIO_SNAP_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "ts":         datetime.now(timezone.utc).isoformat(),
+            "cash_usd":   round(cash_usd, 2),
+            "unrealized": round(unrealized, 2),
+            "total_usd":  total,
+        }) + "\n")
+
+
 def _scanner_loop():
     global _client
     _client  = KalshiClient(api_key_id=KALSHI_API_KEY)
@@ -541,9 +568,11 @@ def _scanner_loop():
         # checks and used to prune stale tickers from _open_tickers so we don't
         # keep calling get_market() for positions Kalshi has already settled.
         live_positions: list[dict] = []
+        _cycle_cash_usd: float = 0.0
         if not _state["dry_run"]:
             try:
                 live_positions = _client.get_positions().get("market_positions", [])
+                _cycle_cash_usd = _client.get_balance().get("balance", 0) / 100
                 active_on_kalshi = {
                     p["ticker"] for p in live_positions
                     if int(float(p.get("position_fp") or p.get("position") or 0)) > 0
@@ -575,8 +604,13 @@ def _scanner_loop():
             with _price_lock:
                 _price_cache.update(fresh)
 
-        # Log price history for all tracked open positions
+        # Log price history and portfolio snapshot (live mode only)
         _log_price_history()
+        if not _state["dry_run"] and _cycle_cash_usd > 0:
+            try:
+                _log_portfolio_snapshot(_cycle_cash_usd, live_positions)
+            except Exception:
+                pass
 
         # Exit check — reuses pre-fetched positions, reads bid from _price_cache
         try:
@@ -713,6 +747,31 @@ def api_positions():
     return jsonify({"positions": positions, "events": events, "balance_usd": balance_usd})
 
 
+@app.route("/api/portfolio_value")
+@_require_auth
+def api_portfolio_value():
+    """Return portfolio value snapshots for the equity curve chart."""
+    if not PORTFOLIO_SNAP_FILE.exists():
+        return jsonify([])
+    snaps = []
+    for line in PORTFOLIO_SNAP_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            s = json.loads(line)
+            snaps.append({
+                "ts":         s["ts"],
+                "cash":       s.get("cash_usd", 0),
+                "unrealized": s.get("unrealized", 0),
+                "total":      s.get("total_usd", 0),
+            })
+        except Exception:
+            pass
+    # Downsample to at most 500 points so the chart stays snappy
+    if len(snaps) > 500:
+        step = len(snaps) // 500
+        snaps = snaps[::step]
+    return jsonify(snaps)
+
+
 @app.route("/api/orders")
 @_require_auth
 def api_orders():
@@ -765,7 +824,7 @@ _ALL_LOG_FILES = (
     EXITS_DRY_FILE,   EXITS_LIVE_FILE,
     PERF_CACHE_DRY,   PERF_CACHE_LIVE,
     SIGNALS_DRY_FILE, SIGNALS_LIVE_FILE,
-    PRICE_HISTORY_FILE,
+    PRICE_HISTORY_FILE, PORTFOLIO_SNAP_FILE,
 )
 
 
@@ -1556,6 +1615,7 @@ HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Kalshi Trader</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0d0d;color:#e0e0e0;font-family:'Courier New',monospace;font-size:13px;min-height:100vh}
@@ -1827,6 +1887,19 @@ HTML = """<!DOCTYPE html>
 
   <!-- PERFORMANCE -->
   <div class="panel" id="panel-performance">
+
+    <!-- Portfolio equity curve (live only) -->
+    <div id="portfolio-chart-wrap" style="margin-bottom:24px;display:none">
+      <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px">
+        <span style="font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.08em">Portfolio Value</span>
+        <span id="port-current" style="font-size:18px;font-weight:bold;color:#4caf50">—</span>
+        <span id="port-change"  style="font-size:12px;color:#888"></span>
+      </div>
+      <div style="position:relative;height:160px">
+        <canvas id="portfolio-chart"></canvas>
+      </div>
+    </div>
+
     <div class="mode-bar">
       <button class="mode-btn active" id="pf-btn-dry"  onclick="switchPerf('dry')">Paper Trading</button>
       <button class="mode-btn"        id="pf-btn-live" onclick="switchPerf('live')">Live Trading</button>
@@ -2879,6 +2952,8 @@ async function loadUpcoming() {
 
 // ── Performance ────────────────────────────────────────────────────────────
 let perfMode = 'dry';
+let _portChart = null;
+
 function switchPerf(mode) {
   perfMode = mode;
   ['dry','live'].forEach(m => {
@@ -2887,9 +2962,84 @@ function switchPerf(mode) {
   const isLive = mode === 'live';
   document.getElementById('pf-lbl-total').textContent = isLive ? 'Live Orders' : 'Paper Bets';
   document.getElementById('pf-lbl-pnl').textContent   = isLive ? 'Realized P&L' : 'Hypothetical P&L';
+  const wrap = document.getElementById('portfolio-chart-wrap');
+  if (wrap) wrap.style.display = isLive ? '' : 'none';
   loadPerformance();
 }
+
+async function loadPortfolioChart() {
+  const wrap = document.getElementById('portfolio-chart-wrap');
+  if (!wrap) return;
+  try {
+    const snaps = await fetch('/api/portfolio_value').then(r => r.json());
+    if (!snaps || snaps.length === 0) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+
+    const rawTs  = snaps.map(s => new Date(s.ts));
+    const totals = snaps.map(s => s.total);
+    const first  = totals[0];
+    const last   = totals[totals.length - 1];
+    const delta  = last - first;
+    const pct    = first ? ((delta / first) * 100).toFixed(1) : '0.0';
+    const deltaStr = (delta >= 0 ? '+' : '') + '$' + delta.toFixed(2);
+
+    document.getElementById('port-current').textContent = '$' + last.toFixed(2);
+    document.getElementById('port-current').style.color = delta >= 0 ? '#4caf50' : '#ff6b6b';
+    document.getElementById('port-change').textContent  = deltaStr + ' (' + (delta >= 0 ? '+' : '') + pct + '%) since first snapshot';
+
+    // Build sparse x-axis labels (show ~8 evenly-spaced timestamps, rest empty)
+    const n = snaps.length;
+    const step = Math.max(1, Math.floor(n / 8));
+    const labels = rawTs.map((d, i) =>
+      i % step === 0 ? d.toLocaleTimeString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''
+    );
+    // Full tooltip labels
+    const fullLabels = rawTs.map(d => d.toLocaleString());
+
+    const color = delta >= 0 ? '#4caf50' : '#ff6b6b';
+    const bgColor = delta >= 0 ? 'rgba(76,175,80,0.08)' : 'rgba(255,107,107,0.08)';
+    const ctx = document.getElementById('portfolio-chart').getContext('2d');
+    if (_portChart) { _portChart.destroy(); _portChart = null; }
+    _portChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          data: totals,
+          borderColor: color,
+          backgroundColor: bgColor,
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.3,
+          fill: true,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: items => fullLabels[items[0].dataIndex],
+              label: item  => '$' + Number(item.raw).toFixed(2),
+            }
+          },
+        },
+        scales: {
+          x: { ticks: { color: '#555', maxRotation: 0, autoSkip: false }, grid: { color: '#1a1a1a' } },
+          y: { ticks: { color: '#555', callback: v => '$' + v.toFixed(0) }, grid: { color: '#1a1a1a' } },
+        },
+      },
+    });
+  } catch (e) {
+    console.warn('portfolio chart error', e);
+    if (wrap) wrap.style.display = 'none';
+  }
+}
+
 async function loadPerformance() {
+  if (perfMode === 'live') loadPortfolioChart();
   try {
     const d = await fetch('/api/performance?mode=' + perfMode).then(r => r.json());
     const s = d.summary;
