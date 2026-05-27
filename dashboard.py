@@ -530,43 +530,9 @@ def _scanner_loop():
             except Exception as e:
                 _log(f"Arb scan error: {e}")
 
-        # Live scan
-        try:
-            _log("Running live scan...")
-            live = scan_live(_client)
-            for s in live:
-                d = _to_dict(s, "live")
-                signals.append(d)
-                if s.edge > 0:
-                    try:
-                        r = executor.execute_live(_client, s)
-                        d["exec_status"] = r.status
-                        d["exec_error"]  = r.error or None
-                        _log(f"[LIVE] {r.player} — {r.status} {r.error or ''}")
-                    except Exception as e:
-                        d["exec_status"] = "error"
-                        d["exec_error"]  = str(e)
-                        _log(f"[LIVE] execute error: {e}")
-                else:
-                    d["exec_status"] = None
-                    d["exec_error"]  = None
-            with _lock:
-                _state["signals"]        = signals
-                _state["last_live_scan"] = datetime.now(timezone.utc).isoformat()
-            _log(f"Live scan done — {len(live)} live signals")
-
-            # Append all signals to today's signal log (buys + skips, full context)
-            dry_run = _state["dry_run"]
-            sig_f   = SIGNALS_DRY_FILE if dry_run else SIGNALS_LIVE_FILE
-            with sig_f.open("a", encoding="utf-8") as fh:
-                for d in signals:
-                    fh.write(json.dumps(d) + "\n")
-        except Exception as e:
-            _log(f"Live scan error: {e}")
-
-        # Fetch live positions once per cycle (live mode only) — shared with exit
-        # checks and used to prune stale tickers from _open_tickers so we don't
-        # keep calling get_market() for positions Kalshi has already settled.
+        # Fetch live positions once per cycle (live mode only).
+        # Done BEFORE scan_live so that exits fire on stale positions before
+        # the scanner has a chance to re-enter them in the same cycle.
         live_positions: list[dict] = []
         _cycle_cash_usd: float = 0.0
         if not _state["dry_run"]:
@@ -604,6 +570,47 @@ def _scanner_loop():
             with _price_lock:
                 _price_cache.update(fresh)
 
+        # Exit check — runs before scan_live so a just-exited ticker gets its SL
+        # cooldown recorded before execute_live() can re-enter it this cycle.
+        try:
+            _check_exits(_client, live_positions)
+        except Exception as e:
+            _log(f"[EXIT] check error: {e}")
+
+        # Live scan — runs after exits so SL cooldowns are already set
+        try:
+            _log("Running live scan...")
+            live = scan_live(_client)
+            for s in live:
+                d = _to_dict(s, "live")
+                signals.append(d)
+                if s.edge > 0:
+                    try:
+                        r = executor.execute_live(_client, s)
+                        d["exec_status"] = r.status
+                        d["exec_error"]  = r.error or None
+                        _log(f"[LIVE] {r.player} — {r.status} {r.error or ''}")
+                    except Exception as e:
+                        d["exec_status"] = "error"
+                        d["exec_error"]  = str(e)
+                        _log(f"[LIVE] execute error: {e}")
+                else:
+                    d["exec_status"] = None
+                    d["exec_error"]  = None
+            with _lock:
+                _state["signals"]        = signals
+                _state["last_live_scan"] = datetime.now(timezone.utc).isoformat()
+            _log(f"Live scan done — {len(live)} live signals")
+
+            # Append all signals to today's signal log (buys + skips, full context)
+            dry_run = _state["dry_run"]
+            sig_f   = SIGNALS_DRY_FILE if dry_run else SIGNALS_LIVE_FILE
+            with sig_f.open("a", encoding="utf-8") as fh:
+                for d in signals:
+                    fh.write(json.dumps(d) + "\n")
+        except Exception as e:
+            _log(f"Live scan error: {e}")
+
         # Log price history and portfolio snapshot (live mode only)
         _log_price_history()
         if not _state["dry_run"] and _cycle_cash_usd > 0:
@@ -611,12 +618,6 @@ def _scanner_loop():
                 _log_portfolio_snapshot(_cycle_cash_usd, live_positions)
             except Exception:
                 pass
-
-        # Exit check — reuses pre-fetched positions, reads bid from _price_cache
-        try:
-            _check_exits(_client, live_positions)
-        except Exception as e:
-            _log(f"[EXIT] check error: {e}")
 
         # Double-down check — runs if enabled
         try:

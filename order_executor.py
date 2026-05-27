@@ -51,6 +51,9 @@ EXITS_LIVE_FILE  = Path("exits_live.jsonl")
 _open_tickers:  set[str]         = set()
 _addon_counts:  dict[str, int]   = {}   # ticker -> add-ons placed so far
 _position_cost: dict[str, float] = {}   # ticker -> total cost USD (initial + add-ons)
+_sl_cooldown:   dict[str, float] = {}   # ticker -> timestamp of most recent SL exit
+
+SL_COOLDOWN_SEC = 3600  # block re-entry for 60 min after a stop-loss
 
 
 def _load_open_tickers():
@@ -292,6 +295,15 @@ def execute_live(client: KalshiClient, signal: LiveSignal) -> OrderResult:
             signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
             f"model_prob {signal.model_prob:.2f} below min {MIN_MODEL_PROB:.2f}",
         )
+    sl_ts = _sl_cooldown.get(signal.ticker, 0)
+    if time.time() - sl_ts < SL_COOLDOWN_SEC:
+        remaining = int(SL_COOLDOWN_SEC - (time.time() - sl_ts))
+        return _skip(
+            datetime.now(timezone.utc).isoformat(),
+            signal.ticker, signal.player, "yes",
+            signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
+            f"SL cooldown active — {remaining}s remaining",
+        )
     return execute(
         client=client,
         ticker=signal.ticker,
@@ -339,6 +351,8 @@ def execute_exit(
         _open_tickers.discard(ticker)
         _addon_counts.pop(ticker, None)
         _position_cost.pop(ticker, None)
+        if reason == "stop_loss":
+            _sl_cooldown[ticker] = time.time()
         _log_exit(result)
         return result
 
@@ -354,6 +368,8 @@ def execute_exit(
         _open_tickers.discard(ticker)
         _addon_counts.pop(ticker, None)
         _position_cost.pop(ticker, None)
+        if reason == "stop_loss":
+            _sl_cooldown[ticker] = time.time()
         notifier.notify_sell(ticker, side, contracts,
                              entry_cents, bid_cents, pnl_usd, reason)
         _log_exit(result)
