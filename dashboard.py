@@ -119,6 +119,7 @@ _state: dict = {
         "profit_take_pct":       0.50,
         "min_ask":               0.05,
         "min_model_prob":        0.65,
+        "max_entry_price":       0.65,
         "double_down_enabled":   False,
         "double_down_min_conf":  0.75,
         "double_down_conf_gain": 0.10,
@@ -165,6 +166,7 @@ def _sync_executor_config():
     executor.PROFIT_TAKE_PCT     = cfg["profit_take_pct"]
     executor.MIN_ASK             = cfg["min_ask"]
     executor.MIN_MODEL_PROB      = float(cfg.get("min_model_prob", 0.0))
+    executor.MAX_ENTRY_PRICE     = float(cfg.get("max_entry_price", 0.65))
     executor.DOUBLE_DOWN_ENABLED    = bool(cfg.get("double_down_enabled", False))
     executor.DOUBLE_DOWN_MIN_CONF   = float(cfg.get("double_down_min_conf", 0.75))
     executor.DOUBLE_DOWN_CONF_GAIN  = float(cfg.get("double_down_conf_gain", 0.10))
@@ -1152,6 +1154,7 @@ _CONFIG_BOUNDS = {
     "profit_take_pct":        (0.20, 0.90),
     "min_ask":                (0.02, 0.25),
     "min_model_prob":         (0.0,  0.95),
+    "max_entry_price":        (0.35, 1.0),
     "double_down_min_conf":   (0.55, 0.95),
     "double_down_conf_gain":  (0.05, 0.30),
     "double_down_max_addons": (1,    5),
@@ -2117,6 +2120,15 @@ HTML = """<!DOCTYPE html>
         Set to 0 to disable. Calibration data suggests 75–80%+ is the reliable zone.
       </p>
       <div class="cfg-row">
+        <label>Max Entry Price</label>
+        <input type="range" id="rng-max-entry-price" min="35" max="99" step="1"
+               oninput="showVal('max-entry-price', this.value + '¢')">
+        <span class="cfg-val" id="val-max-entry-price">65¢</span>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:8px">
+        Skip YES entries priced above this. High-ask markets have severe SL slippage (50%+ vs 35% threshold) due to illiquidity — the bid gaps down far past the trigger price. Data shows 65¢ is the right cutoff.
+      </p>
+      <div class="cfg-row">
         <label>Max Bet (USD)</label>
         <input type="range" id="rng-max-bet" min="5" max="200" step="5"
                oninput="showVal('max-bet', '$'+this.value)">
@@ -2351,6 +2363,8 @@ function syncSliders(cfg) {
            Math.round((cfg.min_ask || 0.05) * 100) + '¢');
   const mmp = Math.round((cfg.min_model_prob || 0) * 100);
   setValue('min-model-prob', mmp, mmp === 0 ? 'off' : mmp + '%');
+  setValue('max-entry-price', Math.round((cfg.max_entry_price || 0.65) * 100),
+           Math.round((cfg.max_entry_price || 0.65) * 100) + '¢');
   const arbH = Math.max(1, Math.round(cfg.arb_interval_sec / 3600));
   setValue('arb-int', arbH, arbH + 'h');
   // Double Down
@@ -2807,6 +2821,7 @@ async function saveConfig() {
     profit_take_pct:   parseFloat(document.getElementById('rng-profit-take').value) / 100,
     min_ask:           parseFloat(document.getElementById('rng-min-ask').value) / 100,
     min_model_prob:    parseFloat(document.getElementById('rng-min-model-prob').value) / 100,
+    max_entry_price:   parseFloat(document.getElementById('rng-max-entry-price').value) / 100,
     double_down_min_conf:   parseFloat(document.getElementById('rng-dd-min-conf').value) / 100,
     double_down_conf_gain:  parseFloat(document.getElementById('rng-dd-conf-gain').value) / 100,
     double_down_max_addons: parseFloat(document.getElementById('rng-dd-max-addons').value),
