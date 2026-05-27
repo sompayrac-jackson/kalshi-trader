@@ -58,7 +58,7 @@ SL_COOLDOWN_SEC = 3600  # block re-entry for 60 min after a stop-loss
 
 def _load_open_tickers():
     """Rebuild tracking state from all order logs minus exit logs at startup."""
-    global _open_tickers, _addon_counts, _position_cost
+    global _open_tickers, _addon_counts, _position_cost, _sl_cooldown
     bought:    set[str]         = set()
     addon_c:   dict[str, int]   = {}
     pos_cost:  dict[str, float] = {}
@@ -86,6 +86,22 @@ def _load_open_tickers():
     _open_tickers  = bought - exited
     _addon_counts  = {t: v for t, v in addon_c.items()  if t not in exited}
     _position_cost = {t: v for t, v in pos_cost.items() if t not in exited}
+    # Reconstruct SL cooldowns from exit logs so restarts don't clear the re-entry block.
+    cooldown: dict[str, float] = {}
+    for f in (EXITS_DRY_FILE, EXITS_LIVE_FILE):
+        if f.exists():
+            for line in f.read_text(encoding="utf-8").splitlines():
+                try:
+                    x = json.loads(line)
+                    if x.get("reason") == "stop_loss":
+                        t  = x.get("ticker", "")
+                        ts = x.get("ts", "")
+                        if t and ts:
+                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            cooldown[t] = max(cooldown.get(t, 0), dt.timestamp())
+                except Exception:
+                    pass
+    _sl_cooldown = cooldown
 
 
 _load_open_tickers()
@@ -398,6 +414,12 @@ def execute_addon(
     Call only after the caller has verified double-down conditions are met.
     """
     ts = datetime.now(timezone.utc).isoformat()
+
+    sl_ts = _sl_cooldown.get(ticker, 0)
+    if time.time() - sl_ts < SL_COOLDOWN_SEC:
+        remaining = int(SL_COOLDOWN_SEC - (time.time() - sl_ts))
+        return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, "live",
+                     f"SL cooldown active — addon blocked ({remaining}s remaining)")
 
     if ask_dollars < MIN_ASK:
         return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, "live",

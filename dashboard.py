@@ -11,6 +11,7 @@ Usage:
 
 import hmac
 import json
+import logging
 import re
 import threading
 import time
@@ -543,7 +544,19 @@ def _scanner_loop():
                     p["ticker"] for p in live_positions
                     if int(float(p.get("position_fp") or p.get("position") or 0)) > 0
                 }
-                stale = {t for t in executor._open_tickers if t not in active_on_kalshi}
+                recently_bought: set[str] = set()
+                if executor.ORDERS_LIVE_FILE.exists():
+                    _rb_cutoff = time.time() - 300
+                    for _rb_line in executor.ORDERS_LIVE_FILE.read_text(encoding="utf-8").splitlines():
+                        try:
+                            _rb_o = json.loads(_rb_line)
+                            _rb_dt = datetime.fromisoformat(_rb_o.get("ts", "").replace("Z", "+00:00"))
+                            if _rb_dt.timestamp() > _rb_cutoff:
+                                recently_bought.add(_rb_o.get("ticker", ""))
+                        except Exception:
+                            pass
+                stale = {t for t in executor._open_tickers
+                         if t not in active_on_kalshi and t not in recently_bought}
                 if stale:
                     _log(f"[POSITIONS] pruning {len(stale)} settled tickers: {stale}")
                     executor._open_tickers -= stale
@@ -3293,6 +3306,9 @@ if __name__ == "__main__":
     _scan_thread = threading.Thread(target=_scanner_loop, daemon=True, name="scanner")
     _scan_thread.start()
     print("Scanner auto-started in LIVE mode")
+
+    if not config.DASHBOARD_PASS:
+        logging.warning("DASHBOARD_PASS is not set — dashboard auth is DISABLED")
 
     print(f"Dashboard running at http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)

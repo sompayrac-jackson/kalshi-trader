@@ -252,6 +252,8 @@ def find_baseball_game(player: str, live_games: list[dict]) -> dict | None:
 # ── Kelly ─────────────────────────────────────────────────────────────────────
 
 def kelly_bet(prob: float, ask: float, bankroll_usd: float, fraction: float = KELLY_FRACTION) -> float:
+    if ask <= 0 or ask >= 1:
+        return 0.0
     b = (1 - ask) / ask
     f = max(0.0, (b * prob - (1 - prob)) / b) * fraction
     return round(f * bankroll_usd, 2)
@@ -383,7 +385,10 @@ def scan_live(client: KalshiClient) -> list[LiveSignal]:
         m = re.search(r'(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})', ticker)
         if not m:
             return None
-        return date(2000 + int(m.group(1)), _MONTHS[m.group(2)], int(m.group(3)))
+        try:
+            return date(2000 + int(m.group(1)), _MONTHS[m.group(2)], int(m.group(3)))
+        except ValueError:
+            return None
 
     _today     = now.date()
     _yesterday = _today - timedelta(days=1)

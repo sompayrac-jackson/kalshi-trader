@@ -5,6 +5,7 @@ Only fires when PUSHOVER_USER_KEY and PUSHOVER_APP_TOKEN are set in config.
 Dry-run orders are never notified — this is intentionally live-only.
 """
 
+import logging
 import requests
 import config
 
@@ -33,7 +34,8 @@ def send(title: str, message: str, priority: int = 0) -> bool:
             timeout=6,
         )
         return resp.status_code == 200
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Pushover failed: {e}")
         return False
 
 
