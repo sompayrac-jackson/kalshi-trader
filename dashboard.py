@@ -1778,6 +1778,54 @@ HTML = """<!DOCTYPE html>
   .cal-stat{width:80px;font-size:10px;color:#666;flex-shrink:0}
   /* Sparkline */
   .spark{display:inline-block;vertical-align:middle}
+
+  /* Analysis 3-col grid */
+  .analysis-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:16px}
+
+  /* ── Mobile / responsive ───────────────────────────────────────────────── */
+  @media (max-width:768px){
+    /* Scrollable tab bar — no wrapping, swipe horizontally */
+    .tabs{overflow-x:auto;-webkit-overflow-scrolling:touch;scroll-behavior:smooth}
+    .tab{padding:10px 16px;flex-shrink:0;white-space:nowrap}
+
+    /* Tighter content */
+    .content{padding:14px 12px}
+
+    /* Header: drop the last-scan timestamp to save space */
+    .hdr-right{display:none}
+    .hdr{padding:10px 14px;gap:10px}
+
+    /* Settings sliders: stack label above slider instead of side-by-side */
+    .cfg-row{flex-wrap:wrap;gap:6px}
+    .cfg-row label{width:100%}
+    .cfg-row input[type=range]{max-width:100%}
+
+    /* Analysis 3-col → 1-col */
+    .analysis-grid{grid-template-columns:1fr}
+
+    /* Log terminal shorter on phone */
+    .log-box{height:300px}
+
+    /* Cards: tighter padding */
+    .card{padding:10px 14px;min-width:100px}
+    .card .val{font-size:20px}
+
+    /* Fixtures: let time column wrap below team names on small screens */
+    .fixture{flex-wrap:wrap}
+    .fix-time{width:100%;text-align:left;margin-top:6px;padding-left:56px}
+  }
+
+  @media (max-width:480px){
+    .hdr h1{font-size:14px}
+    .tab{padding:9px 12px;font-size:11px}
+    .content{padding:10px 8px}
+    .card{padding:8px 12px;min-width:82px}
+    .card .val{font-size:17px}
+    .btn{padding:8px 14px;font-size:11px}
+    .setting-group{padding:14px 14px}
+    .fix-sport{width:40px}
+    .fix-time{padding-left:44px}
+  }
 </style>
 </head>
 <body>
@@ -1972,7 +2020,7 @@ HTML = """<!DOCTYPE html>
       <div class="card"><div class="lbl">Avg Edge (buys)</div><div class="val green" id="an-avgedge">-</div></div>
     </div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:16px">
+    <div class="analysis-grid">
 
       <div class="setting-group" style="margin:0">
         <h3>By Sport</h3>
@@ -2010,7 +2058,7 @@ HTML = """<!DOCTYPE html>
     <div class="setting-group" style="margin-top:16px">
       <h3>Entry Timing — Win Rate by Game Period</h3>
       <div style="overflow-x:auto">
-        <table style="width:100%;font-size:12px;border-collapse:collapse;min-width:500px">
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333">
             <th style="padding:5px 8px">Period</th>
             <th style="padding:5px 8px;text-align:right">Entries</th>
@@ -2028,7 +2076,7 @@ HTML = """<!DOCTYPE html>
     <div class="setting-group" style="margin-top:16px">
       <h3>Missed Trades — Skipped Opportunities with Positive Edge</h3>
       <div style="overflow-x:auto">
-        <table style="width:100%;font-size:12px;border-collapse:collapse;min-width:700px">
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
           <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333">
             <th style="padding:5px 8px">Player</th>
             <th style="padding:5px 8px">Sport</th>
@@ -2052,7 +2100,7 @@ HTML = """<!DOCTYPE html>
         </span>
       </h3>
       <div style="overflow-x:auto">
-        <table style="width:100%;font-size:11px;border-collapse:collapse;min-width:900px">
+        <table style="width:100%;font-size:11px;border-collapse:collapse">
           <thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333">
             <th style="padding:5px 6px">Time</th>
             <th style="padding:5px 6px">Sport</th>
@@ -2210,7 +2258,6 @@ HTML = """<!DOCTYPE html>
       <p style="font-size:10px;color:#555;margin-bottom:12px">
         Sell if current bid rises X% above your entry price.
       </p>
-      <button class="btn btn-gray" onclick="saveConfig()" style="margin-top:6px">Save Config</button>
     </div>
 
     <div class="setting-group">
@@ -2258,7 +2305,11 @@ HTML = """<!DOCTYPE html>
       <p style="font-size:10px;color:#555;margin-bottom:12px">
         Total position cost cap as a multiple of Max Bet. At 2×: $50 cap with $25 max bet.
       </p>
-      <button class="btn btn-gray" onclick="saveConfig()" style="margin-top:6px">Save Config</button>
+    </div>
+
+    <div style="padding:4px 0 8px">
+      <button class="btn btn-gray" onclick="saveConfig()">Save Config</button>
+      <span id="save-config-msg" style="font-size:11px;color:#4caf50;margin-left:12px"></span>
     </div>
 
   </div>
@@ -2834,6 +2885,8 @@ async function saveConfig() {
   });
   const data = await r.json();
   if (!data.ok) { alert('Error: ' + (data.errors || []).join(', ')); return; }
+  const msg = document.getElementById('save-config-msg');
+  if (msg) { msg.textContent = 'Saved ✓'; setTimeout(() => { msg.textContent = ''; }, 2500); }
   loadStatus();
 }
 
