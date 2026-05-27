@@ -50,20 +50,23 @@ EXITS_LIVE_FILE  = Path("exits_live.jsonl")
 # Tickers we already hold (bought but not yet exited/settled).
 # Prevents re-buying the same live market every scan cycle.
 
-_open_tickers:  set[str]         = set()
-_addon_counts:  dict[str, int]   = {}   # ticker -> add-ons placed so far
-_position_cost: dict[str, float] = {}   # ticker -> total cost USD (initial + add-ons)
-_sl_cooldown:   dict[str, float] = {}   # ticker -> timestamp of most recent SL exit
+_open_tickers:        set[str]         = set()
+_addon_counts:        dict[str, int]   = {}   # ticker -> add-ons placed so far
+_position_cost:       dict[str, float] = {}   # ticker -> total cost USD (initial + add-ons)
+_sl_cooldown:         dict[str, float] = {}   # ticker -> timestamp of most recent SL exit
+_sl_cooldown_blocks:  dict[str, int]   = {}   # ticker -> number of times blocked by SL cooldown
+_position_entry_ts:   dict[str, float] = {}   # ticker -> unix timestamp of first entry
 
 SL_COOLDOWN_SEC = 3600  # block re-entry for 60 min after a stop-loss
 
 
 def _load_open_tickers():
     """Rebuild tracking state from all order logs minus exit logs at startup."""
-    global _open_tickers, _addon_counts, _position_cost, _sl_cooldown
+    global _open_tickers, _addon_counts, _position_cost, _sl_cooldown, _position_entry_ts
     bought:    set[str]         = set()
     addon_c:   dict[str, int]   = {}
     pos_cost:  dict[str, float] = {}
+    entry_ts:  dict[str, float] = {}
     for f in (ORDERS_DRY_FILE, ORDERS_LIVE_FILE):
         if f.exists():
             for line in f.read_text(encoding="utf-8").splitlines():
@@ -75,6 +78,10 @@ def _load_open_tickers():
                         if o.get("is_addon"):
                             addon_c[t] = addon_c.get(t, 0) + 1
                         pos_cost[t] = pos_cost.get(t, 0.0) + float(o.get("cost_usd", 0))
+                        if t not in entry_ts and o.get("ts"):
+                            entry_ts[t] = datetime.fromisoformat(
+                                o["ts"].replace("Z", "+00:00")
+                            ).timestamp()
                 except Exception:
                     pass
     exited: set[str] = set()
@@ -85,9 +92,10 @@ def _load_open_tickers():
                     exited.add(json.loads(line)["ticker"])
                 except Exception:
                     pass
-    _open_tickers  = bought - exited
-    _addon_counts  = {t: v for t, v in addon_c.items()  if t not in exited}
-    _position_cost = {t: v for t, v in pos_cost.items() if t not in exited}
+    _open_tickers      = bought - exited
+    _addon_counts      = {t: v for t, v in addon_c.items()   if t not in exited}
+    _position_cost     = {t: v for t, v in pos_cost.items()  if t not in exited}
+    _position_entry_ts = {t: v for t, v in entry_ts.items()  if t not in exited}
     # Reconstruct SL cooldowns from exit logs so restarts don't clear the re-entry block.
     cooldown: dict[str, float] = {}
     for f in (EXITS_DRY_FILE, EXITS_LIVE_FILE):
@@ -127,22 +135,30 @@ class OrderResult:
     status:       str  = ""
     error:        str  = ""
     is_addon:     bool = False
+    sport:        str  = ""
+    score_state:  str  = ""
+    model_prob:   float = 0.0
+    score_diff:   int  = 0   # our team/player runs or sets ahead (negative = trailing)
+    bid_cents:    int  = 0   # yes_bid at order time (spread = ask - bid)
+    spread_cents: int  = 0   # ask_cents - bid_cents at entry
 
 
 @dataclass
 class ExitResult:
-    ts:          str
-    ticker:      str
-    side:        str
-    contracts:   int
-    entry_cents: int
-    exit_cents:  int
-    pnl_usd:     float
-    reason:      str   # 'stop_loss' or 'profit_take'
-    dry_run:     bool
-    order_id:    str = ""
-    status:      str = ""
-    error:       str = ""
+    ts:                str
+    ticker:            str
+    side:              str
+    contracts:         int
+    entry_cents:       int
+    exit_cents:        int
+    pnl_usd:           float
+    reason:            str   # 'stop_loss' or 'profit_take'
+    dry_run:           bool
+    order_id:          str   = ""
+    status:            str   = ""
+    error:             str   = ""
+    hold_duration_sec: int   = 0
+    slippage_pct:      float = 0.0  # (entry - exit) / entry; negative = favourable (PT)
 
 
 # ── Core executor ─────────────────────────────────────────────────────────────
@@ -156,6 +172,10 @@ def execute(
     kelly_usd: float,
     edge: float,
     source: str,
+    sport: str = "",
+    score_state: str = "",
+    model_prob: float = 0.0,
+    score_diff: int = 0,
 ) -> OrderResult:
     """
     Place a limit order. Returns an OrderResult regardless of success/failure.
@@ -207,6 +227,10 @@ def execute(
         edge=edge,
         source=source,
         dry_run=DRY_RUN,
+        sport=sport,
+        score_state=score_state,
+        model_prob=model_prob,
+        score_diff=score_diff,
     )
 
     # ── Balance check ─────────────────────────────────────────────────────────
@@ -233,6 +257,9 @@ def execute(
             result.error  = f"insufficient liquidity: need {contracts}, available {available:.0f}"
             _log(result)
             return result
+        bid_d = float(market.get("yes_bid_dollars") or 0)
+        result.bid_cents    = round(bid_d * 100)
+        result.spread_cents = price_cents - result.bid_cents
     except Exception as e:
         result.status = "error"
         result.error  = f"liquidity check failed: {e}"
@@ -244,7 +271,8 @@ def execute(
         result.status   = "dry_run"
         result.order_id = f"dry-{uuid.uuid4().hex[:8]}"
         _open_tickers.add(ticker)
-        _position_cost[ticker] = cost_usd
+        _position_cost[ticker]     = cost_usd
+        _position_entry_ts[ticker] = time.time()
         _print(result)
         _log(result)
         return result
@@ -261,7 +289,8 @@ def execute(
         result.status   = resp.get("order", {}).get("status", "submitted")
         if result.status in ("submitted", "resting", "executed"):
             _open_tickers.add(ticker)
-            _position_cost[ticker] = cost_usd
+            _position_cost[ticker]     = cost_usd
+            _position_entry_ts[ticker] = time.time()
             notifier.notify_buy(ticker, player, side, contracts,
                                 price_cents, cost_usd, edge)
         _print(result)
@@ -323,11 +352,13 @@ def execute_live(client: KalshiClient, signal: LiveSignal) -> OrderResult:
     sl_ts = _sl_cooldown.get(signal.ticker, 0)
     if time.time() - sl_ts < SL_COOLDOWN_SEC:
         remaining = int(SL_COOLDOWN_SEC - (time.time() - sl_ts))
+        _sl_cooldown_blocks[signal.ticker] = _sl_cooldown_blocks.get(signal.ticker, 0) + 1
+        block_n = _sl_cooldown_blocks[signal.ticker]
         return _skip(
             datetime.now(timezone.utc).isoformat(),
             signal.ticker, signal.player, "yes",
             signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
-            f"SL cooldown active — {remaining}s remaining",
+            f"SL cooldown active — {remaining}s remaining (block #{block_n})",
         )
     return execute(
         client=client,
@@ -338,6 +369,10 @@ def execute_live(client: KalshiClient, signal: LiveSignal) -> OrderResult:
         kelly_usd=signal.kelly_usd,
         edge=signal.edge,
         source="live",
+        sport=signal.sport,
+        score_state=signal.score_state,
+        model_prob=signal.model_prob,
+        score_diff=getattr(signal, "score_diff", 0),
     )
 
 
@@ -364,10 +399,16 @@ def execute_exit(
     pnl_usd = (bid_cents - entry_cents) * contracts / 100
     is_dry  = DRY_RUN and not force_live
 
+    _ets     = _position_entry_ts.get(ticker, 0.0)
+    hold_sec = int(time.time() - _ets) if _ets else 0
+    slip_pct = round((entry_cents - bid_cents) / entry_cents, 4) if entry_cents > 0 else 0.0
+
     result = ExitResult(
         ts=ts, ticker=ticker, side=side, contracts=contracts,
         entry_cents=entry_cents, exit_cents=bid_cents,
         pnl_usd=pnl_usd, reason=reason, dry_run=is_dry,
+        hold_duration_sec=hold_sec,
+        slippage_pct=slip_pct,
     )
 
     if is_dry:
@@ -376,6 +417,7 @@ def execute_exit(
         _open_tickers.discard(ticker)
         _addon_counts.pop(ticker, None)
         _position_cost.pop(ticker, None)
+        _position_entry_ts.pop(ticker, None)
         if reason == "stop_loss":
             _sl_cooldown[ticker] = time.time()
         _log_exit(result)
@@ -393,6 +435,7 @@ def execute_exit(
         _open_tickers.discard(ticker)
         _addon_counts.pop(ticker, None)
         _position_cost.pop(ticker, None)
+        _position_entry_ts.pop(ticker, None)
         if reason == "stop_loss":
             _sl_cooldown[ticker] = time.time()
         notifier.notify_sell(ticker, side, contracts,

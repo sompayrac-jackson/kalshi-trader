@@ -39,6 +39,7 @@ class LiveSignal:
     opponent:    str = ""
     home_away:   str = ""  # "HOME" | "AWAY" | "" (tennis)
     event_ticker: str = ""
+    score_diff:  int = 0   # our team/player lead in runs (baseball) or sets (tennis)
 
 
 # ── Live score feed (ESPN public API) ────────────────────────────────────────
@@ -303,6 +304,8 @@ def tennis_signal(km: dict, live_matches: list[dict], tour: str, bankroll_usd: f
 
     score_state = f"{sets_p1}-{sets_p2} sets, {games_p1}-{games_p2} games (srv: {'P1' if p1_serving else 'P2'})"
     opponent = p2_name if p1_is_our_player else p1_name
+    our_sets = sets_p1 if p1_is_our_player else sets_p2
+    opp_sets = sets_p2 if p1_is_our_player else sets_p1
     return LiveSignal(
         ticker=km["ticker"],
         player=player,
@@ -315,6 +318,7 @@ def tennis_signal(km: dict, live_matches: list[dict], tour: str, bankroll_usd: f
         opponent=opponent,
         home_away="",
         event_ticker=km.get("event_ticker", ""),
+        score_diff=our_sets - opp_sets,
     )
 
 
@@ -344,6 +348,8 @@ def baseball_signal(km: dict, live_games: list[dict], bankroll_usd: float) -> Li
     score_state = f"{half} {inning}, {score_away}-{score_home}"
     away = game["away"]
     opponent = away if player_is_home else home
+    our_score = score_home if player_is_home else score_away
+    opp_score = score_away if player_is_home else score_home
     return LiveSignal(
         ticker=km["ticker"],
         player=player,
@@ -356,6 +362,7 @@ def baseball_signal(km: dict, live_games: list[dict], bankroll_usd: float) -> Li
         opponent=opponent,
         home_away="HOME" if player_is_home else "AWAY",
         event_ticker=km.get("event_ticker", ""),
+        score_diff=our_score - opp_score,
     )
 
 
