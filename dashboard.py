@@ -120,6 +120,7 @@ _state: dict = {
         "min_ask":               0.05,
         "min_model_prob":        0.65,
         "max_entry_price":       0.65,
+        "exits_enabled":         True,
         "double_down_enabled":   False,
         "double_down_min_conf":  0.75,
         "double_down_conf_gain": 0.10,
@@ -160,6 +161,7 @@ def _sync_executor_config():
     """Push dashboard config sliders into scanner and executor module globals."""
     cfg = _state["config"]
     executor.DRY_RUN             = _state["dry_run"]
+    executor.EXITS_ENABLED       = bool(cfg.get("exits_enabled", True))
     executor.MIN_EDGE            = cfg["min_edge"]
     executor.MAX_BET_USD         = cfg["max_bet_usd"]
     executor.STOP_LOSS_PCT       = cfg["stop_loss_pct"]
@@ -208,6 +210,8 @@ def _check_exits(client: KalshiClient, live_positions: list[dict] | None = None)
     live_positions: pre-fetched from Kalshi by the scanner loop (avoids a redundant
     get_positions() call here). Pass None only when calling outside the scanner loop.
     """
+    if not executor.EXITS_ENABLED:
+        return
     cfg             = _state["config"]
     stop_loss_pct   = cfg["stop_loss_pct"]
     profit_take_pct = cfg["profit_take_pct"]
@@ -1160,7 +1164,7 @@ _CONFIG_BOUNDS = {
     "double_down_max_addons": (1,    5),
     "double_down_max_total":  (1.0,  5.0),
 }
-_CONFIG_BOOLS = {"double_down_enabled"}
+_CONFIG_BOOLS = {"double_down_enabled", "exits_enabled"}
 
 @app.route("/api/config", methods=["POST"])
 @_require_auth
@@ -2240,6 +2244,16 @@ HTML = """<!DOCTYPE html>
 
     <div class="setting-group">
       <h3>Exit Rules</h3>
+      <div class="controls" style="align-items:center;gap:16px;margin-bottom:14px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="chk-exits" onchange="toggleExits(this.checked)" style="width:16px;height:16px">
+          Enable exits (Stop-Loss + Profit-Take)
+        </label>
+      </div>
+      <p style="font-size:10px;color:#555;margin-bottom:14px">
+        When disabled, all positions hold to Kalshi auto-settlement — a clean binary bet on game outcomes.
+        Re-enable to restore automatic SL/PT exits.
+      </p>
       <div class="cfg-row">
         <label>Stop-Loss</label>
         <input type="range" id="rng-stop-loss" min="10" max="60" step="5"
@@ -2418,6 +2432,9 @@ function syncSliders(cfg) {
            Math.round((cfg.max_entry_price || 0.65) * 100) + '¢');
   const arbH = Math.max(1, Math.round(cfg.arb_interval_sec / 3600));
   setValue('arb-int', arbH, arbH + 'h');
+  // Exits toggle
+  const chkExits = document.getElementById('chk-exits');
+  if (chkExits) chkExits.checked = cfg.exits_enabled !== false;
   // Double Down
   const chkDd = document.getElementById('chk-dd');
   if (chkDd) chkDd.checked = !!cfg.double_down_enabled;
@@ -2854,6 +2871,13 @@ async function clearLogs(mode) {
 }
 
 // ── Config save ────────────────────────────────────────────────────────────
+async function toggleExits(enabled) {
+  await fetch('/api/config', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({exits_enabled: enabled})
+  });
+}
+
 async function toggleDoubleDown(enabled) {
   await fetch('/api/config', {
     method: 'POST', headers: {'Content-Type':'application/json'},
