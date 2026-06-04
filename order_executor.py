@@ -142,6 +142,25 @@ class OrderResult:
     score_diff:   int  = 0   # our team/player runs or sets ahead (negative = trailing)
     bid_cents:    int  = 0   # yes_bid at order time (spread = ask - bid)
     spread_cents: int  = 0   # ask_cents - bid_cents at entry
+    # Game state (numeric)
+    inning:        int   = 0
+    half:          str   = ""
+    current_set:   int   = 0
+    outs:          int   = -1
+    # Base state
+    on_first:      bool  = False
+    on_second:     bool  = False
+    on_third:      bool  = False
+    scoring_1plus: float = 0.0
+    # Three-signal model
+    markov_prob:     float = 0.0
+    espn_win_prob:   float = 0.0
+    vegas_live_prob: float = 0.0
+    vegas_open_prob: float = 0.0
+    # Entry context
+    is_live:      bool  = True    # False = pre-game arb order
+    pregame_ask:  float = 0.0     # Kalshi ask before game started (0 = unavailable)
+    home_away:    str   = ""      # "HOME" | "AWAY" | ""
 
 
 @dataclass
@@ -177,6 +196,21 @@ def execute(
     score_state: str = "",
     model_prob: float = 0.0,
     score_diff: int = 0,
+    inning: int = 0,
+    half: str = "",
+    current_set: int = 0,
+    outs: int = -1,
+    on_first: bool = False,
+    on_second: bool = False,
+    on_third: bool = False,
+    scoring_1plus: float = 0.0,
+    markov_prob: float = 0.0,
+    espn_win_prob: float = 0.0,
+    vegas_live_prob: float = 0.0,
+    vegas_open_prob: float = 0.0,
+    is_live: bool = True,
+    pregame_ask: float = 0.0,
+    home_away: str = "",
 ) -> OrderResult:
     """
     Place a limit order. Returns an OrderResult regardless of success/failure.
@@ -232,6 +266,21 @@ def execute(
         score_state=score_state,
         model_prob=model_prob,
         score_diff=score_diff,
+        inning=inning,
+        half=half,
+        current_set=current_set,
+        outs=outs,
+        on_first=on_first,
+        on_second=on_second,
+        on_third=on_third,
+        scoring_1plus=scoring_1plus,
+        markov_prob=markov_prob,
+        espn_win_prob=espn_win_prob,
+        vegas_live_prob=vegas_live_prob,
+        vegas_open_prob=vegas_open_prob,
+        is_live=is_live,
+        pregame_ask=pregame_ask,
+        home_away=home_away,
     )
 
     # ── Balance check ─────────────────────────────────────────────────────────
@@ -324,10 +373,11 @@ def execute_arb(client: KalshiClient, signal: ArbSignal) -> OrderResult:
         kelly_usd=signal.kelly_usd,
         edge=signal.edge,
         source="arb",
+        is_live=False,
     )
 
 
-def execute_live(client: KalshiClient, signal: LiveSignal) -> OrderResult:
+def execute_live(client: KalshiClient, signal: LiveSignal, pregame_ask: float = 0.0) -> OrderResult:
     """Execute a live model signal. Buys YES if model says underpriced."""
     if signal.edge <= 0:
         return _skip(
@@ -374,6 +424,21 @@ def execute_live(client: KalshiClient, signal: LiveSignal) -> OrderResult:
         score_state=signal.score_state,
         model_prob=signal.model_prob,
         score_diff=getattr(signal, "score_diff", 0),
+        inning=getattr(signal, "inning", 0),
+        half=getattr(signal, "half", ""),
+        current_set=getattr(signal, "current_set", 0),
+        outs=getattr(signal, "outs", -1),
+        on_first=getattr(signal, "on_first", False),
+        on_second=getattr(signal, "on_second", False),
+        on_third=getattr(signal, "on_third", False),
+        scoring_1plus=getattr(signal, "scoring_1plus", 0.0),
+        markov_prob=getattr(signal, "markov_prob", 0.0),
+        espn_win_prob=getattr(signal, "espn_win_prob", 0.0),
+        vegas_live_prob=getattr(signal, "vegas_live_prob", 0.0),
+        vegas_open_prob=getattr(signal, "vegas_open_prob", 0.0),
+        is_live=True,
+        pregame_ask=pregame_ask,
+        home_away=getattr(signal, "home_away", ""),
     )
 
 

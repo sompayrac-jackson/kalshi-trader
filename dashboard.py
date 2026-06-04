@@ -49,6 +49,8 @@ SIGNALS_DRY_FILE  = Path("signals_dry.jsonl")
 SIGNALS_LIVE_FILE = Path("signals_live.jsonl")
 PRICE_HISTORY_FILE    = Path("price_history.jsonl")
 PORTFOLIO_SNAP_FILE   = Path("portfolio_snapshots.jsonl")
+PREGAME_SNAP_FILE     = Path("pregame_snapshots.jsonl")
+SETTLEMENTS_FILE      = Path("settlements.jsonl")
 
 def _orders_file(mode: str) -> Path:
     return ORDERS_LIVE_FILE if mode == "live" else ORDERS_DRY_FILE
@@ -99,6 +101,12 @@ _price_lock  = threading.Lock()
 
 _lock       = threading.Lock()
 _stop_event = threading.Event()
+
+# Pre-game Kalshi ask prices — ticker -> ask_dollars captured before game start.
+# Used to measure how much the market moved from open to our live entry.
+_pregame_cache:     dict[str, float] = {}
+_pregame_cache_lock = threading.Lock()
+_pregame_last_snap  = 0.0          # unix timestamp of last pregame snapshot
 _scan_thread: threading.Thread | None = None
 _client: KalshiClient | None = None
 
@@ -505,6 +513,62 @@ def _log_portfolio_snapshot(cash_usd: float, live_positions: list[dict]):
         }) + "\n")
 
 
+def _log_pregame_snapshots():
+    """
+    Every 10 minutes, snapshot Kalshi ask prices for all upcoming (pre-game)
+    baseball and tennis markets and store them in _pregame_cache + pregame_snapshots.jsonl.
+    These become the pregame_ask baseline for any subsequent live entry.
+    """
+    global _pregame_last_snap
+    now = time.time()
+    if now - _pregame_last_snap < 600:   # 10-minute throttle
+        return
+    _pregame_last_snap = now
+
+    try:
+        client = _client or KalshiClient(api_key_id=KALSHI_API_KEY)
+        dt_now = datetime.now(timezone.utc)
+        snaps = []
+        for series in ("KXATPMATCH", "KXWTAMATCH", "KXMLBGAME"):
+            try:
+                resp = client._get("/markets", params={"limit": 200, "series_ticker": series, "status": "open"})
+                for m in resp.get("markets", []):
+                    if m.get("result") or not m.get("yes_ask_dollars"):
+                        continue
+                    odt = m.get("occurrence_datetime", "")
+                    if not odt:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(odt.replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    # Only snapshot truly pre-game markets (not yet started for tennis;
+                    # for baseball use 30-min buffer before occurrence_datetime)
+                    hours_until = (dt - dt_now).total_seconds() / 3600
+                    if hours_until < 0:
+                        continue
+                    ticker = m.get("ticker", "")
+                    ask    = float(m["yes_ask_dollars"])
+                    with _pregame_cache_lock:
+                        if ticker not in _pregame_cache:
+                            _pregame_cache[ticker] = ask
+                    snaps.append({
+                        "ts":     dt_now.isoformat(),
+                        "ticker": ticker,
+                        "series": series,
+                        "ask":    ask,
+                        "hours_until": round(hours_until, 2),
+                    })
+            except Exception:
+                pass
+        if snaps:
+            with PREGAME_SNAP_FILE.open("a", encoding="utf-8") as fh:
+                for s in snaps:
+                    fh.write(json.dumps(s) + "\n")
+    except Exception as e:
+        _log(f"[PREGAME] snapshot error: {e}")
+
+
 def _scanner_loop():
     global _client
     _client  = KalshiClient(api_key_id=KALSHI_API_KEY)
@@ -572,6 +636,64 @@ def _scanner_loop():
                     with _price_lock:
                         for t in stale:
                             _price_cache.pop(t, None)
+                    # Settlement journal — write one row per settled ticker
+                    _settle_ts = datetime.now(timezone.utc).isoformat()
+                    try:
+                        _orders_map: dict[str, dict] = {}
+                        if executor.ORDERS_LIVE_FILE.exists():
+                            for _sl in executor.ORDERS_LIVE_FILE.read_text(encoding="utf-8").splitlines():
+                                try:
+                                    _so = json.loads(_sl)
+                                    _st = _so.get("ticker", "")
+                                    if _st and _st not in _orders_map and _so.get("contracts", 0) > 0:
+                                        _orders_map[_st] = _so
+                                except Exception:
+                                    pass
+                        with SETTLEMENTS_FILE.open("a", encoding="utf-8") as _sf:
+                            for _st in stale:
+                                _so = _orders_map.get(_st, {})
+                                try:
+                                    _mkt = _client.get_market(_st)
+                                    _res = _mkt.get("result", "")
+                                except Exception:
+                                    _res = ""
+                                _side = _so.get("side", "yes")
+                                _won  = (_side == "yes" and _res == "yes") or (_side == "no" and _res == "no")
+                                _cost = float(_so.get("cost_usd", 0))
+                                _conts = int(_so.get("contracts", 0))
+                                _pnl  = round((_conts - _cost) if _won else -_cost, 2) if _cost else 0.0
+                                _sf.write(json.dumps({
+                                    "ts":           _settle_ts,
+                                    "ticker":       _st,
+                                    "player":       _so.get("player", ""),
+                                    "sport":        _so.get("sport", ""),
+                                    "result":       _res,
+                                    "side":         _side,
+                                    "won":          _won,
+                                    "pnl_usd":      _pnl,
+                                    "contracts":    _conts,
+                                    "entry_cents":  _so.get("price_cents", 0),
+                                    "cost_usd":     _cost,
+                                    "edge":         _so.get("edge", 0.0),
+                                    "model_prob":   _so.get("model_prob", 0.0),
+                                    "markov_prob":  _so.get("markov_prob", 0.0),
+                                    "espn_win_prob":  _so.get("espn_win_prob", 0.0),
+                                    "vegas_live_prob": _so.get("vegas_live_prob", 0.0),
+                                    "vegas_open_prob": _so.get("vegas_open_prob", 0.0),
+                                    "score_diff":   _so.get("score_diff", 0),
+                                    "inning":       _so.get("inning", 0),
+                                    "half":         _so.get("half", ""),
+                                    "outs":         _so.get("outs", -1),
+                                    "on_first":     _so.get("on_first", False),
+                                    "on_second":    _so.get("on_second", False),
+                                    "on_third":     _so.get("on_third", False),
+                                    "pregame_ask":  _so.get("pregame_ask", 0.0),
+                                    "home_away":    _so.get("home_away", ""),
+                                    "source":       _so.get("source", ""),
+                                    "is_live":      _so.get("is_live", True),
+                                }) + "\n")
+                    except Exception as _se:
+                        _log(f"[SETTLE] journal error: {_se}")
             except Exception as e:
                 _log(f"[POSITIONS] fetch failed: {e}")
 
@@ -605,7 +727,9 @@ def _scanner_loop():
                 signals.append(d)
                 if s.edge > 0:
                     try:
-                        r = executor.execute_live(_client, s)
+                        with _pregame_cache_lock:
+                            _pa = _pregame_cache.get(s.ticker, 0.0)
+                        r = executor.execute_live(_client, s, pregame_ask=_pa)
                         d["exec_status"] = r.status
                         d["exec_error"]  = r.error or None
                         _log(f"[LIVE] {r.player} — {r.status} {r.error or ''}")
@@ -643,6 +767,12 @@ def _scanner_loop():
             _check_double_downs(_client)
         except Exception as e:
             _log(f"[DD] check error: {e}")
+
+        # Pre-game snapshot (throttled to every 10 min)
+        try:
+            _log_pregame_snapshots()
+        except Exception as e:
+            _log(f"[PREGAME] snapshot error: {e}")
 
         _stop_event.wait(cfg["live_interval_sec"])
 
@@ -845,6 +975,7 @@ _ALL_LOG_FILES = (
     PERF_CACHE_DRY,   PERF_CACHE_LIVE,
     SIGNALS_DRY_FILE, SIGNALS_LIVE_FILE,
     PRICE_HISTORY_FILE, PORTFOLIO_SNAP_FILE,
+    PREGAME_SNAP_FILE, SETTLEMENTS_FILE,
 )
 
 

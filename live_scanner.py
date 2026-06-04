@@ -41,6 +41,21 @@ class LiveSignal:
     home_away:   str = ""  # "HOME" | "AWAY" | "" (tennis)
     event_ticker: str = ""
     score_diff:  int = 0   # our team/player lead in runs (baseball) or sets (tennis)
+    # Game state (numeric)
+    inning:        int   = 0       # baseball: inning number; tennis: 0
+    half:          str   = ""      # baseball: "Top"|"Bot"; tennis: ""
+    current_set:   int   = 0       # tennis: current set number; baseball: 0
+    outs:          int   = -1      # baseball: 0/1/2; -1 = unavailable
+    # Base state (baseball only)
+    on_first:      bool  = False
+    on_second:     bool  = False
+    on_third:      bool  = False
+    scoring_1plus: float = 0.0     # ESPN inning scoring prob e.g. 0.2765
+    # Three-signal model
+    markov_prob:     float = 0.0   # raw Markov output
+    espn_win_prob:   float = 0.0   # ESPN homeWinPercentage, adjusted for our side
+    vegas_live_prob: float = 0.0   # DraftKings live implied prob, our side
+    vegas_open_prob: float = 0.0   # DraftKings opening line implied — pre-game baseline
 
 
 # ── Live score feed (ESPN public API) ────────────────────────────────────────
@@ -146,6 +161,7 @@ def fetch_espn_baseball() -> list[dict]:
         period = status.get("period", 1)
         is_bottom = "Bottom" in status.get("type", {}).get("shortDetail", "")
         games.append({
+            "game_id":    comp.get("id", ""),
             "home": home.get("team", {}).get("displayName", ""),
             "away": away.get("team", {}).get("displayName", ""),
             "score_home": int(home.get("score", 0)),
@@ -166,6 +182,80 @@ def parse_inning(inning_str: str) -> tuple[int, bool]:
     except ValueError:
         inning = 1
     return inning, is_bottom
+
+
+def fetch_espn_baseball_summaries(live_games: list[dict]) -> dict[str, dict]:
+    """
+    Fetch ESPN summary (win probability + DraftKings odds) for each live game.
+    Returns {game_id: summary_data}. Fails silently per game.
+    """
+    def _american_to_prob(odds_str) -> float:
+        if not odds_str:
+            return 0.0
+        try:
+            o = int(odds_str)
+            return 100 / (o + 100) if o > 0 else abs(o) / (abs(o) + 100)
+        except (ValueError, TypeError):
+            return 0.0
+
+    summaries: dict[str, dict] = {}
+    for game in live_games:
+        gid = game.get("game_id", "")
+        if not gid:
+            continue
+        try:
+            resp = requests.get(
+                "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary",
+                params={"event": gid}, timeout=6
+            ).json()
+
+            wp_list = resp.get("winprobability", [])
+            home_win_pct = wp_list[-1]["homeWinPercentage"] if wp_list else None
+
+            vegas_open_home = vegas_live_home = 0.0
+            for pc in resp.get("pickcenter", []):
+                if str(pc.get("provider", {}).get("id", "")) == "100":   # DraftKings
+                    ml = pc.get("moneyline", {}).get("home", {})
+                    vegas_open_home = _american_to_prob(ml.get("open", {}).get("odds"))
+                    vegas_live_home = _american_to_prob(
+                        ml.get("live", {}).get("odds") or ml.get("close", {}).get("odds")
+                    )
+                    break
+
+            sit = resp.get("situation", {})
+            scoring_1plus = 0.0
+            for note in sit.get("situationNotes", []):
+                text = note.get("text", "")
+                if "1+" in text:
+                    m = re.search(r"(\d+\.?\d*)%", text)
+                    if m:
+                        scoring_1plus = float(m.group(1)) / 100
+                    break
+
+            summaries[gid] = {
+                "home_win_pct":    home_win_pct,
+                "vegas_open_home": vegas_open_home,
+                "vegas_live_home": vegas_live_home,
+                "outs":            sit.get("outs", -1),
+                "on_first":        bool(sit.get("onFirst")),
+                "on_second":       bool(sit.get("onSecond")),
+                "on_third":        bool(sit.get("onThird")),
+                "scoring_1plus":   scoring_1plus,
+            }
+        except Exception:
+            pass
+    return summaries
+
+
+def _consensus_prob(markov: float, espn, vegas) -> float:
+    """Weighted blend: Vegas 50%, ESPN 30%, Markov 20% when all available."""
+    if espn and vegas:
+        return round(0.20 * markov + 0.30 * espn + 0.50 * vegas, 4)
+    if vegas:
+        return round(0.30 * markov + 0.70 * vegas, 4)
+    if espn:
+        return round(0.40 * markov + 0.60 * espn, 4)
+    return round(markov, 4)
 
 
 # ── Name matching ─────────────────────────────────────────────────────────────
@@ -325,12 +415,21 @@ def tennis_signal(km: dict, live_matches: list[dict], tour: str, bankroll_usd: f
         home_away="",
         event_ticker=km.get("event_ticker", ""),
         score_diff=our_sets - opp_sets,
+        inning=0, half="", current_set=current_set,
+        outs=-1, on_first=False, on_second=False, on_third=False, scoring_1plus=0.0,
+        markov_prob=model_prob,
+        espn_win_prob=0.0, vegas_live_prob=0.0, vegas_open_prob=0.0,
     )
 
 
 # ── Baseball live signal ──────────────────────────────────────────────────────
 
-def baseball_signal(km: dict, live_games: list[dict], bankroll_usd: float) -> LiveSignal | None:
+def baseball_signal(
+    km: dict,
+    live_games: list[dict],
+    bankroll_usd: float,
+    summaries: dict[str, dict] | None = None,
+) -> LiveSignal | None:
     player = km["player"]  # for baseball this is the team name / abbreviation
     game = find_baseball_game(player, live_games)
     if not game:
@@ -344,7 +443,29 @@ def baseball_signal(km: dict, live_games: list[dict], bankroll_usd: float) -> Li
     expanded = _expand_mlb(player)
     player_is_home = expanded.lower() in home.lower() or name_match(player, home) > 0.75
     model_home = prob_home_wins_simple(inning, is_bottom, score_home, score_away)
-    model_prob = model_home if player_is_home else 1 - model_home
+    markov_prob = model_home if player_is_home else 1 - model_home
+
+    # Fetch ESPN/Vegas enrichment from pre-fetched summaries
+    espn_win_prob = vegas_live_prob = vegas_open_prob = 0.0
+    outs, on_first, on_second, on_third, scoring_1plus = -1, False, False, False, 0.0
+
+    game_id = game.get("game_id", "")
+    if summaries and game_id and game_id in summaries:
+        s = summaries[game_id]
+        raw_home_wp = s.get("home_win_pct")
+        if raw_home_wp is not None:
+            espn_win_prob = raw_home_wp if player_is_home else 1 - raw_home_wp
+        raw_vegas_open = s.get("vegas_open_home", 0.0)
+        raw_vegas_live = s.get("vegas_live_home", 0.0)
+        vegas_open_prob = raw_vegas_open if player_is_home else (1 - raw_vegas_open if raw_vegas_open else 0.0)
+        vegas_live_prob = raw_vegas_live if player_is_home else (1 - raw_vegas_live if raw_vegas_live else 0.0)
+        outs          = s.get("outs", -1)
+        on_first      = s.get("on_first", False)
+        on_second     = s.get("on_second", False)
+        on_third      = s.get("on_third", False)
+        scoring_1plus = s.get("scoring_1plus", 0.0)
+
+    model_prob = _consensus_prob(markov_prob, espn_win_prob or None, vegas_live_prob or None)
     edge = model_prob - km["ask"]
 
     if abs(edge) < MIN_EDGE:
@@ -369,6 +490,14 @@ def baseball_signal(km: dict, live_games: list[dict], bankroll_usd: float) -> Li
         home_away="HOME" if player_is_home else "AWAY",
         event_ticker=km.get("event_ticker", ""),
         score_diff=our_score - opp_score,
+        inning=inning, half=half, current_set=0,
+        outs=outs,
+        on_first=on_first, on_second=on_second, on_third=on_third,
+        scoring_1plus=scoring_1plus,
+        markov_prob=markov_prob,
+        espn_win_prob=espn_win_prob,
+        vegas_live_prob=vegas_live_prob,
+        vegas_open_prob=vegas_open_prob,
     )
 
 
@@ -420,6 +549,8 @@ def scan_live(client: KalshiClient) -> list[LiveSignal]:
     live_tennis = fetch_espn_tennis()
     live_baseball = fetch_espn_baseball()
     print(f"  {len(live_tennis)} live tennis matches, {len(live_baseball)} live baseball games")
+    baseball_summaries = fetch_espn_baseball_summaries(live_baseball)
+    print(f"  {len(baseball_summaries)} ESPN summaries fetched")
 
     # Build Kalshi market dicts
     def to_km(m: dict) -> dict:
@@ -462,7 +593,7 @@ def scan_live(client: KalshiClient) -> list[LiveSignal]:
             continue
         expanded = _expand_mlb(km["player"])
         print(f"  [baseball] {km['ticker']} player='{km['player']}' -> '{expanded}'")
-        sig = baseball_signal(km, live_baseball, balance_usd)
+        sig = baseball_signal(km, live_baseball, balance_usd, summaries=baseball_summaries)
         if sig:
             signals.append(sig)
 
