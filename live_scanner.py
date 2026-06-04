@@ -22,6 +22,7 @@ import config
 KALSHI_API_KEY = config.KALSHI_API_KEY
 MIN_EDGE = 0.04          # minimum model edge to flag (4 cents)
 KELLY_FRACTION = 0.5
+MIN_TENNIS_SET = 3       # only signal from Set 3+ (Sets 1-2 have 0% historical WR)
 
 
 # ── Signal dataclass ──────────────────────────────────────────────────────────
@@ -288,6 +289,11 @@ def tennis_signal(km: dict, live_matches: list[dict], tour: str, bankroll_usd: f
     sets_p2    = match["sets_p2"]
     p1_serving = match["p1_serving"]
     best_of   = match.get("best_of", 3)
+
+    # Skip early sets — historically 0% WR in Sets 1 and 2
+    current_set = sets_p1 + sets_p2 + 1
+    if current_set < MIN_TENNIS_SET:
+        return None
 
     model_p1 = prob_win_match_from_score(
         p1_serve, p2_serve,
