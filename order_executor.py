@@ -46,6 +46,13 @@ ORDERS_DRY_FILE  = Path("orders_dry.jsonl")
 ORDERS_LIVE_FILE = Path("orders_live.jsonl")
 EXITS_DRY_FILE   = Path("exits_dry.jsonl")
 EXITS_LIVE_FILE  = Path("exits_live.jsonl")
+SETTLEMENTS_FILE = Path("settlements.jsonl")
+
+# ── Strategy filters (deepdive5.py findings) ──────────────────────────────────
+# Toggle any to False to disable that guard individually.
+REQUIRE_ESPN_OR_VEGAS = True   # baseball: skip markov-only signals (no ESPN/Vegas data)
+SKIP_TWO_OUTS         = True   # baseball: 2-outs entries had 27% historical WR
+SKIP_LATE_SLIM_LEAD   = True   # baseball: inning 6+ with +1 lead had 14-18% historical WR
 
 # ── Open-position deduplication ───────────────────────────────────────────────
 # Tickers we already hold (bought but not yet exited/settled).
@@ -99,6 +106,14 @@ def _load_open_tickers():
                     exited.add(json.loads(line)["ticker"])
                 except Exception:
                     pass
+    # Also exclude tickers already in settlements.jsonl — prevents re-discovering
+    # Kalshi-settled positions as "open" after a scanner restart.
+    if SETTLEMENTS_FILE.exists():
+        for line in SETTLEMENTS_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                exited.add(json.loads(line)["ticker"])
+            except Exception:
+                pass
     _open_tickers      = bought - exited
     _open_events       = {_event_ticker(t) for t in _open_tickers}
     _addon_counts      = {t: v for t, v in addon_c.items()   if t not in exited}
@@ -425,6 +440,36 @@ def execute_live(client: KalshiClient, signal: LiveSignal, pregame_ask: float = 
             signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
             f"SL cooldown active — {remaining}s remaining (block #{block_n})",
         )
+
+    # ── Baseball strategy filters (deepdive5.py analysis) ────────────────────
+    if signal.sport == "baseball":
+        _outs       = getattr(signal, "outs", -1)
+        _inning     = getattr(signal, "inning", 0)
+        _score_diff = getattr(signal, "score_diff", 0)
+        _espn       = getattr(signal, "espn_win_prob", 0.0)
+        _vegas      = getattr(signal, "vegas_live_prob", 0.0)
+        if REQUIRE_ESPN_OR_VEGAS and _espn == 0.0 and _vegas == 0.0:
+            return _skip(
+                datetime.now(timezone.utc).isoformat(),
+                signal.ticker, signal.player, "yes",
+                signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
+                "baseball: no ESPN/Vegas data — markov-only signal skipped",
+            )
+        if SKIP_TWO_OUTS and _outs == 2:
+            return _skip(
+                datetime.now(timezone.utc).isoformat(),
+                signal.ticker, signal.player, "yes",
+                signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
+                "baseball: 2 outs — historically 27% WR",
+            )
+        if SKIP_LATE_SLIM_LEAD and _inning >= 6 and _score_diff == 1:
+            return _skip(
+                datetime.now(timezone.utc).isoformat(),
+                signal.ticker, signal.player, "yes",
+                signal.kalshi_ask, signal.kelly_usd, signal.edge, "live",
+                f"baseball: inning {_inning} with +1 lead — historically 14-18% WR",
+            )
+
     return execute(
         client=client,
         ticker=signal.ticker,

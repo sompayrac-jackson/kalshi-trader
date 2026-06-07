@@ -630,6 +630,7 @@ def _scanner_loop():
                 if stale:
                     _log(f"[POSITIONS] pruning {len(stale)} settled tickers: {stale}")
                     executor._open_tickers -= stale
+                    executor._open_events -= {executor._event_ticker(t) for t in stale}
                     for t in stale:
                         executor._addon_counts.pop(t, None)
                         executor._position_cost.pop(t, None)
@@ -649,8 +650,18 @@ def _scanner_loop():
                                         _orders_map[_st] = _so
                                 except Exception:
                                     pass
+                        # Dedup: skip tickers already written to avoid duplicate rows on restart
+                        _already_settled: set[str] = set()
+                        if SETTLEMENTS_FILE.exists():
+                            for _line in SETTLEMENTS_FILE.read_text(encoding="utf-8").splitlines():
+                                try:
+                                    _already_settled.add(json.loads(_line)["ticker"])
+                                except Exception:
+                                    pass
                         with SETTLEMENTS_FILE.open("a", encoding="utf-8") as _sf:
                             for _st in stale:
+                                if _st in _already_settled:
+                                    continue
                                 _so = _orders_map.get(_st, {})
                                 try:
                                     _mkt = _client.get_market(_st)
