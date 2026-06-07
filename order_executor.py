@@ -52,6 +52,7 @@ EXITS_LIVE_FILE  = Path("exits_live.jsonl")
 # Prevents re-buying the same live market every scan cycle.
 
 _open_tickers:        set[str]         = set()
+_open_events:         set[str]         = set()  # event_ticker -> blocks opposite side of same game
 _addon_counts:        dict[str, int]   = {}   # ticker -> add-ons placed so far
 _position_cost:       dict[str, float] = {}   # ticker -> total cost USD (initial + add-ons)
 _sl_cooldown:         dict[str, float] = {}   # ticker -> timestamp of most recent SL exit
@@ -61,9 +62,14 @@ _position_entry_ts:   dict[str, float] = {}   # ticker -> unix timestamp of firs
 SL_COOLDOWN_SEC = 3600  # block re-entry for 60 min after a stop-loss
 
 
+def _event_ticker(ticker: str) -> str:
+    """Strip the final -TEAM suffix to get the Kalshi event key."""
+    return ticker.rsplit("-", 1)[0] if "-" in ticker else ticker
+
+
 def _load_open_tickers():
     """Rebuild tracking state from all order logs minus exit logs at startup."""
-    global _open_tickers, _addon_counts, _position_cost, _sl_cooldown, _position_entry_ts
+    global _open_tickers, _open_events, _addon_counts, _position_cost, _sl_cooldown, _position_entry_ts
     bought:    set[str]         = set()
     addon_c:   dict[str, int]   = {}
     pos_cost:  dict[str, float] = {}
@@ -94,6 +100,7 @@ def _load_open_tickers():
                 except Exception:
                     pass
     _open_tickers      = bought - exited
+    _open_events       = {_event_ticker(t) for t in _open_tickers}
     _addon_counts      = {t: v for t, v in addon_c.items()   if t not in exited}
     _position_cost     = {t: v for t, v in pos_cost.items()  if t not in exited}
     _position_entry_ts = {t: v for t, v in entry_ts.items()  if t not in exited}
@@ -226,6 +233,11 @@ def execute(
         return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, source,
                      "already holding position in this market")
 
+    ev = _event_ticker(ticker)
+    if ev in _open_events:
+        return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, source,
+                     f"already holding opposite side of this game ({ev})")
+
     if ask_dollars < MIN_ASK:
         return _skip(ts, ticker, player, side, ask_dollars, kelly_usd, edge, source,
                      f"yes_ask {ask_dollars:.2f} below min {MIN_ASK:.2f} — market has priced out player")
@@ -321,6 +333,7 @@ def execute(
         result.status   = "dry_run"
         result.order_id = f"dry-{uuid.uuid4().hex[:8]}"
         _open_tickers.add(ticker)
+        _open_events.add(ev)
         _position_cost[ticker]     = cost_usd
         _position_entry_ts[ticker] = time.time()
         _print(result)
@@ -339,6 +352,7 @@ def execute(
         result.status   = resp.get("order", {}).get("status", "submitted")
         if result.status in ("submitted", "resting", "executed"):
             _open_tickers.add(ticker)
+            _open_events.add(ev)
             _position_cost[ticker]     = cost_usd
             _position_entry_ts[ticker] = time.time()
             notifier.notify_buy(ticker, player, side, contracts,
@@ -481,6 +495,7 @@ def execute_exit(
         result.status   = "dry_run"
         result.order_id = f"dry-exit-{uuid.uuid4().hex[:8]}"
         _open_tickers.discard(ticker)
+        _open_events.discard(_event_ticker(ticker))
         _addon_counts.pop(ticker, None)
         _position_cost.pop(ticker, None)
         _position_entry_ts.pop(ticker, None)
@@ -499,6 +514,7 @@ def execute_exit(
         result.order_id = resp.get("order", {}).get("order_id", "")
         result.status   = resp.get("order", {}).get("status", "submitted")
         _open_tickers.discard(ticker)
+        _open_events.discard(_event_ticker(ticker))
         _addon_counts.pop(ticker, None)
         _position_cost.pop(ticker, None)
         _position_entry_ts.pop(ticker, None)
