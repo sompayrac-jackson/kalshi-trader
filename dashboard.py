@@ -128,7 +128,7 @@ _state: dict = {
         "min_ask":               0.05,
         "min_model_prob":        0.65,
         "max_entry_price":       0.65,
-        "exits_enabled":         True,
+        "exits_enabled":         False,
         "double_down_enabled":   False,
         "double_down_min_conf":  0.75,
         "double_down_conf_gain": 0.10,

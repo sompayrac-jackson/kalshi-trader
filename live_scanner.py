@@ -518,9 +518,13 @@ def scan_live(client: KalshiClient) -> list[LiveSignal]:
 
     # Baseball: occurrence_datetime is the settlement deadline (~3h after first pitch),
     # NOT the start time — filtering dt < now would exclude in-progress games.
-    # ESPN match confirms the game is actually live.
-    # Date-filter tickers to today + yesterday so future games (MAY29+) are never
-    # matched against live ESPN game data from a different day/matchup.
+    # Two guards prevent entering pre-game markets:
+    #   1. Date guard: ticker date must be today or yesterday.
+    #   2. Deadline guard: occurrence_datetime must be ≤ now + 3.5h.
+    #      Since deadline ≈ first pitch + 3h, this excludes games whose first pitch
+    #      is more than ~30 min away — preventing tonight's unstarted games from
+    #      being matched against an afternoon live game by the same team.
+    # ESPN liveness (find_baseball_game returns None for pre-game) is the final gate.
     _MONTHS = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
                'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
     def _ticker_game_date(ticker: str):
@@ -534,11 +538,14 @@ def scan_live(client: KalshiClient) -> list[LiveSignal]:
 
     _today     = now.date()
     _yesterday = _today - timedelta(days=1)
+    _deadline_cutoff = now + timedelta(hours=3.5)
     baseball_markets = [
         m for m in client._get("/markets", params={"limit": 100, "series_ticker": "KXMLBGAME", "status": "open"}).get("markets", [])
         if not m.get("result")
         and m.get("yes_ask_dollars")
         and _ticker_game_date(m.get("ticker", "")) in (_today, _yesterday)
+        and (not m.get("occurrence_datetime")
+             or datetime.fromisoformat(m["occurrence_datetime"].replace("Z", "+00:00")) <= _deadline_cutoff)
     ]
 
     print(f"  {len(tennis_markets)} live Kalshi tennis markets")

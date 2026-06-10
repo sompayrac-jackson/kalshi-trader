@@ -28,7 +28,7 @@ MIN_EDGE    = 0.03    # skip signals below this edge even if passed in
 MIN_ASK     = 0.05    # skip if market prices YES below this — near-zero asks mean
                       # the market has almost certainly priced out this player already
 
-EXITS_ENABLED    = True   # set False to hold all positions to Kalshi settlement (no SL or PT)
+EXITS_ENABLED    = False  # set True to enable SL/PT exits; False = hold to Kalshi settlement
 STOP_LOSS_PCT    = 0.35   # sell if bid drops this fraction below entry price
 PROFIT_TAKE_PCT  = 0.50   # sell if bid rises this fraction above entry price
 MIN_MODEL_PROB   = 0.0    # skip entries where model_prob is below this (0 = disabled)
