@@ -22,7 +22,7 @@ git diff --staged
 
 # These files must NOT appear in git status:
 #   .env, private_key.pem, *.jsonl, *.log
-git push origin main
+git push origin master
 ```
 
 ---
@@ -150,7 +150,7 @@ certbot --nginx -d yourdomain.com
 ```bash
 ssh root@YOUR_DROPLET_IP
 cd /opt/kalshi_trader
-git pull origin main
+git pull origin master
 systemctl restart kalshi-dashboard
 ```
 

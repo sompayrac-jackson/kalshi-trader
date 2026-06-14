@@ -63,12 +63,80 @@ def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            pass
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
     return out
+
+
+def load_signals_compact(path: Path, filter_deploy_ts: str):
+    """
+    Single streaming pass through signals_live.jsonl — never loads full file into memory.
+    Returns compact summary structures for sections 1, 2, and 4.
+    """
+    sig_count = 0
+    sig_ts_min = sig_ts_max = None
+
+    # Section 2: first baseball BUY signal per ticker since filter deploy date
+    bb_buy_first: dict[str, dict] = {}
+
+    # Section 4: first executed tennis BUY per ticker + skip reason counts
+    tn_exec_first: dict[str, dict] = {}
+    tn_skip_reasons: dict[str, int] = {}
+
+    if not path.exists():
+        return sig_count, sig_ts_min, sig_ts_max, bb_buy_first, tn_exec_first, tn_skip_reasons
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                s = json.loads(line)
+            except Exception:
+                continue
+
+            sig_count += 1
+            ts = s.get("ts", "")
+            if ts:
+                if sig_ts_min is None or ts < sig_ts_min:
+                    sig_ts_min = ts
+                if sig_ts_max is None or ts > sig_ts_max:
+                    sig_ts_max = ts
+
+            sport  = s.get("sport", "")
+            dirn   = s.get("direction", "")
+            estat  = s.get("exec_status", "")
+            ticker = s.get("ticker", "")
+
+            if sport == "baseball" and dirn == "BUY" and ts >= filter_deploy_ts:
+                if ticker and ticker not in bb_buy_first:
+                    bb_buy_first[ticker] = {
+                        "ticker":       ticker,
+                        "ts":           ts,
+                        "exec_status":  estat,
+                        "exec_error":   s.get("exec_error", "") or "",
+                    }
+
+            if sport == "tennis" and dirn == "BUY":
+                if estat in ("submitted", "resting", "executed", "dry_run"):
+                    if ticker and ticker not in tn_exec_first:
+                        tn_exec_first[ticker] = {
+                            "ticker":      ticker,
+                            "ts":          ts,
+                            "exec_status": estat,
+                            "current_set": s.get("current_set", 0),
+                            "score_diff":  s.get("score_diff", 0),
+                        }
+                elif estat == "skipped":
+                    reason = (s.get("exec_error") or "unknown")[:55]
+                    tn_skip_reasons[reason] = tn_skip_reasons.get(reason, 0) + 1
+
+    return sig_count, sig_ts_min, sig_ts_max, bb_buy_first, tn_exec_first, tn_skip_reasons
 
 
 def is_real_order(o: dict) -> bool:
@@ -83,7 +151,7 @@ def post_filter(ts: str) -> bool:
 
 # ── Section 1: Era & Data Health ──────────────────────────────────────────────
 
-def section1(signals, orders, settlements, snapshots):
+def section1(sig_count, sig_ts_min, sig_ts_max, orders, settlements, snapshots):
     sep("Section 1 — Era & Data Health")
 
     real_orders = [o for o in orders if is_real_order(o)]
@@ -91,10 +159,10 @@ def section1(signals, orders, settlements, snapshots):
     tn_orders   = [o for o in real_orders if o.get("sport") == "tennis"]
 
     all_ts = [o["ts"] for o in real_orders if o.get("ts")]
-    sig_ts = [s["ts"] for s in signals if s.get("ts")]
 
-    date_range  = f"{min(all_ts)[:10]} → {max(all_ts)[:10]}" if all_ts else "N/A"
-    sig_range   = f"{min(sig_ts)[:10]} → {max(sig_ts)[:10]}" if sig_ts else "N/A"
+    date_range = f"{min(all_ts)[:10]} → {max(all_ts)[:10]}" if all_ts else "N/A"
+    sig_range  = (f"{sig_ts_min[:10]} → {sig_ts_max[:10]}"
+                  if sig_ts_min and sig_ts_max else "N/A")
 
     post_orders = [o for o in real_orders if post_filter(o.get("ts", ""))]
 
@@ -109,7 +177,7 @@ def section1(signals, orders, settlements, snapshots):
     print(f"  Signals date range: {sig_range}")
     print(f"  Real orders       : {len(real_orders)}  (baseball={len(bb_orders)}, tennis={len(tn_orders)})")
     print(f"  Post-{FILTER_DEPLOY_DATE} orders : {len(post_orders)}")
-    print(f"  Total signals     : {len(signals)}")
+    print(f"  Total signals     : {sig_count}")
     print(f"  settlements.jsonl : {n_settle} rows | "
           f"P&L = ${pnl_settle:+.2f} | WR = {pct(wrate(wins_settle, n_settle))}")
     print(f"  Equity (snapshots): ${snap_start:.2f} → ${snap_end:.2f}  "
@@ -139,28 +207,14 @@ def _classify_filter(exec_error: str) -> str | None:
     return None
 
 
-def section2(signals, settlements):
+def section2(bb_buy_first: dict, settlements):
     sep("Section 2 — Filter Effectiveness (post-deployment counterfactual)")
 
-    deploy_ts = FILTER_DEPLOY_DATE + "T00:00:00"
-
-    # Baseball BUY signals since filter deployment
-    bb_buy = [
-        s for s in signals
-        if s.get("sport") == "baseball"
-        and s.get("direction") == "BUY"
-        and s.get("ts", "") >= deploy_ts
-    ]
-    if not bb_buy:
+    if not bb_buy_first:
         print(f"  No baseball BUY signals found after {FILTER_DEPLOY_DATE}.")
         return
 
-    # Deduplicate to first occurrence per ticker
-    first_by_ticker: dict[str, dict] = {}
-    for s in sorted(bb_buy, key=lambda x: x.get("ts", "")):
-        t = s.get("ticker", "")
-        if t and t not in first_by_ticker:
-            first_by_ticker[t] = s
+    first_by_ticker = bb_buy_first  # already deduplicated by streaming pass
 
     # Build settlement lookup
     settle_by_ticker = {s["ticker"]: s for s in settlements if s.get("ticker")}
@@ -296,27 +350,13 @@ def section3(orders, settlements):
 
 # ── Section 4: Tennis Deep Dive ───────────────────────────────────────────────
 
-def section4(signals, settlements):
+def section4(tn_exec_first: dict, tn_skip_reasons: dict, settlements):
     sep("Section 4 — Tennis Deep Dive (first analysis)")
 
     settle_map = {s["ticker"]: s for s in settlements if s.get("ticker")}
 
-    # Settled tennis entries from orders
-    tn_signals = [
-        s for s in signals
-        if s.get("sport") == "tennis"
-        and s.get("direction") == "BUY"
-        and s.get("exec_status") in ("submitted", "resting", "executed", "dry_run")
-    ]
-
-    # Deduplicate to first execution per ticker
-    first_by_ticker: dict[str, dict] = {}
-    for s in sorted(tn_signals, key=lambda x: x.get("ts", "")):
-        t = s.get("ticker", "")
-        if t and t not in first_by_ticker:
-            first_by_ticker[t] = s
-
-    settled_tn = {t: sig for t, sig in first_by_ticker.items() if t in settle_map}
+    # tn_exec_first is already deduplicated by the streaming pass
+    settled_tn = {t: sig for t, sig in tn_exec_first.items() if t in settle_map}
 
     if not settled_tn:
         print("  No settled tennis entries found in signals_live.jsonl.")
@@ -325,20 +365,9 @@ def section4(signals, settlements):
 
     print(f"  Settled tennis entries: {len(settled_tn)}")
 
-    # Skip reason breakdown
-    tn_skips = [
-        s for s in signals
-        if s.get("sport") == "tennis" and s.get("direction") == "BUY"
-        and s.get("exec_status") == "skipped"
-    ]
-    skip_counts: dict[str, int] = defaultdict(int)
-    for s in tn_skips:
-        reason = (s.get("exec_error") or "unknown")[:55]
-        skip_counts[reason] += 1
-
-    if skip_counts:
+    if tn_skip_reasons:
         print(f"\n  Tennis BUY skip reasons:")
-        for r, c in sorted(skip_counts.items(), key=lambda x: -x[1])[:10]:
+        for r, c in sorted(tn_skip_reasons.items(), key=lambda x: -x[1])[:10]:
             print(f"    {c:>4}×  {r}")
 
     # Win rate by current_set
@@ -726,20 +755,25 @@ def main():
     print(f"{'Filter deploy date: ' + FILTER_DEPLOY_DATE:^{W}}")
     print("=" * W)
 
-    signals     = load_jsonl(SIGNALS_FILE)
+    # signals_live.jsonl can be 100+ MB — stream it once into compact structures
+    deploy_ts = FILTER_DEPLOY_DATE + "T00:00:00"
+    print("  Streaming signals_live.jsonl...")
+    sig_count, sig_ts_min, sig_ts_max, bb_buy_first, tn_exec_first, tn_skip_reasons = \
+        load_signals_compact(SIGNALS_FILE, deploy_ts)
+
     orders      = load_jsonl(ORDERS_FILE)
     settlements = load_jsonl(SETTLEMENTS_FILE)
     exits       = load_jsonl(EXITS_FILE)
     snapshots   = load_jsonl(SNAPSHOTS_FILE)
 
-    print(f"\n  Loaded: {len(signals)} signals, {len(orders)} order rows, "
+    print(f"\n  Loaded: {sig_count} signals (streamed), {len(orders)} order rows, "
           f"{len(settlements)} settlement rows, {len(exits)} exits, "
           f"{len(snapshots)} snapshots")
 
-    section1(signals, orders, settlements, snapshots)
-    section2(signals, settlements)
+    section1(sig_count, sig_ts_min, sig_ts_max, orders, settlements, snapshots)
+    section2(bb_buy_first, settlements)
     section3(orders, settlements)
-    section4(signals, settlements)
+    section4(tn_exec_first, tn_skip_reasons, settlements)
     section5(exits)
     section6(orders, settlements)
     section7(orders, settlements)

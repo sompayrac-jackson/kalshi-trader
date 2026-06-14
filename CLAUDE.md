@@ -41,14 +41,16 @@ Keys used:
 |------|---------|
 | `config.py` | Loads secrets from `.env` / env vars; `_require()` raises on missing |
 | `kalshi_client.py` | Signed API client (RSA-PSS); market/order/portfolio + `sell_order()` |
-| `live_scanner.py` | Background scanner: tennis + baseball signals, Kelly sizing |
+| `live_scanner.py` | Background scanner: tennis + baseball signals; three-signal baseball model (Markov + ESPN win prob + DK Vegas odds); Kelly sizing |
 | `arb_scanner.py` | Arbitrage scan using The Odds API |
-| `order_executor.py` | Entry + exit order logic, deduplication, file routing |
+| `order_executor.py` | Entry + exit order logic, deduplication, strategy filters, SL cooldown, file routing |
 | `notifier.py` | Pushover push notifications (live trades only) |
 | `dashboard.py` | Flask dashboard: all API routes + background thread |
 | `runner.py` | CLI entry point for headless scanner |
 | `models/tennis_model.py` | Markov chain tennis win probability |
-| `models/baseball_model.py` | Baseball win probability model |
+| `models/baseball_model.py` | Baseball win probability via Markov chain over 24 base-out states |
+| `models/serve_stats.py` | Per-player serve win % from Jeff Sackmann ATP/WTA CSVs; fuzzy name matching |
+| `deepdive5.py`, `deepdive6.py` | Post-session analysis scripts (run locally against JSONL logs) |
 | `DEPLOY.md` | Full deployment guide (systemd, nginx, scp secrets) |
 
 ## Log Files (all gitignored via `*.jsonl`)
@@ -65,8 +67,16 @@ Keys used:
 ## Order Executor Key Behaviours
 
 - **One position per market** — `_open_tickers` set prevents re-buying same ticker every 30s. Rebuilt from log files on scanner start via `_load_open_tickers()`.
+- **One position per game** — `_open_events` set blocks buying both sides of the same game (event_ticker deduplication).
 - **Min ask filter** — `MIN_ASK=0.05`: skips markets where YES < 5¢ (player nearly eliminated, model stale). Configurable in Settings.
-- **Exit logic** — `_check_exits()` runs every scan cycle. Stop-loss: sell if bid drops `stop_loss_pct` below entry. Profit-take: sell if bid rises `profit_take_pct` above entry. Both configurable.
+- **Max entry price** — `MAX_ENTRY_PRICE=0.65`: skips YES entries above 65¢. Above this level, MLB order books gap on decisive turns — stop-loss slippage averages 50%+ vs the 35% trigger price rather than the intended 35%.
+- **Set filter (tennis)** — `MIN_TENNIS_SET=3` in `live_scanner.py`: skips Set 1 and Set 2 entries. Historical WR: Set 1 = 36% (52 entries), Set 2 = 41.7% — Markov model has too little differentiated information at that stage.
+- **Baseball strategy filters** — Applied in `execute_live()` before any order:
+  - `REQUIRE_ESPN_OR_VEGAS=True`: skips Markov-only baseball signals (blocks entries when both ESPN win prob and Vegas odds are unavailable)
+  - `SKIP_TWO_OUTS=True`: skips entries with 2 outs — historical WR 27%
+  - `SKIP_LATE_SLIM_LEAD=True`: skips inning 6+ with exactly +1 run lead — historical WR 14–18%
+- **Exit logic** — Disabled by default (`EXITS_ENABLED=False`); bot holds to Kalshi settlement. When enabled: stop-loss fires if bid drops `stop_loss_pct` below entry; profit-take fires if bid rises `profit_take_pct` above entry.
+- **SL cooldown** — After any stop-loss exit, re-entry on the same ticker is blocked for `SL_COOLDOWN_SEC=3600` (60 min). Cooldown is persisted in `exits_*.jsonl` and reconstructed on restart via `_load_open_tickers()`, so service restarts don't clear it.
 - **Notifications** — `notifier.notify_buy()` / `notifier.notify_sell()` called on real (non-dry-run) fills only. Stop-loss uses Pushover priority=1 (bypasses quiet hours).
 
 ## Critical Kalshi API Quirks
@@ -95,8 +105,21 @@ RSA-PSS signing. Message = `f"{timestamp_ms}{METHOD}{/trade-api/v2/path}"`. Head
 Base: `https://site.api.espn.com/apis/site/v2/sports`
 - Tennis: `/tennis/atp/scoreboard`, `/tennis/wta/scoreboard`
 - Baseball: `/baseball/mlb/scoreboard`
+- Baseball summary: `https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary?event={game_id}`
 
-No auth required. `competitions[0].status.type.state == "in"` = live.
+No auth required. No rate limit. `competitions[0].status.type.state == "in"` = live.
+
+### Baseball summary endpoint
+
+`game_id` comes from `competitions[].id` in the scoreboard response. Called once per live game per scan cycle in `fetch_espn_baseball_summaries()`. Returns:
+
+- **ESPN win probability** — `winprobability[-1].homeWinPercentage` (0.0–1.0, updated per play by ESPN's model)
+- **DraftKings live moneyline** — `pickcenter[provider.id=="100"].moneyline.home.live.odds` (American format — **eliminates need for Odds API for baseball live odds**)
+- **DraftKings opening line** — `.moneyline.home.open.odds` (pre-game baseline; logged but not used in consensus)
+- **Base-out situation** — `situation.outs`, `situation.onFirst/onSecond/onThird`
+- **Inning scoring probability** — `situation.situationNotes` ("Chance of scoring 1+ runs this inning: XX.XX%")
+
+These feed `_consensus_prob()`: **Vegas 50%, ESPN 30%, Markov 20%** when all three are available. Falls back gracefully: Vegas-only → 70/30 blend; ESPN-only → 60/40 blend; Markov-only → Markov alone (and `REQUIRE_ESPN_OR_VEGAS=True` blocks the trade).
 
 ### MLB team name matching
 Kalshi uses abbreviations (ATH, SD, CWS). ESPN uses full names. `MLB_ALIASES` dict in `live_scanner.py` maps all 30 teams. `find_baseball_game()` does substring match on expanded names.
@@ -158,11 +181,34 @@ Check `skip_reasons` in analysis. After enabling `min_model_prob`, confirm signa
 ### Next model improvement hypotheses (to test as data accumulates):
 - **Early vs late game confidence requirement** — require higher model_prob in innings 1–3 vs 7–9; the model has more variance early when the score hasn't differentiated
 - **Score state integration** — model currently treats "Top 3, 1-0" same as "Top 3, 4-0"; the run differential should shift probability more aggressively in mid-game
-- **Opponent quality signal** — Kalshi pricing implicitly encodes Vegas lines; if our model consistently overestimates underdogs, add a prior toward the market price
+- **Tennis three-signal model** — ESPN doesn't offer live win prob for tennis; no free Vegas source identified. Elo-adjusted serve priors (`serve_win_prob_from_elo()` in `tennis_model.py`) are implemented but not yet wired in as the serve stats fallback
 
 ## Known Issues / TODO
 
-- Duplicate baseball game cards in Live Now: ESPN substring matching can return multiple hits for common city/team names. Needs deduplication by canonical team pair.
-- Odds API free tier is 500 req/month — warn if arb_interval_sec < 21600 (6h).
-- Performance tab for live mode resolves against Kalshi settlement but doesn't yet account for partial fills or exit P&L from exits_live.jsonl.
-- `min_model_prob` currently only filters `execute_live()` — arb signals are not filtered by model confidence (no `model_prob` field on `ArbSignal`).
+### Fixed — no longer apply
+- Future game ticker contamination: date filter in `scan_live()` limits baseball to today/yesterday + 3.5h deadline cutoff guard
+- Re-entry cascade after stop-loss: `SL_COOLDOWN_SEC=3600` blocks re-entry for 60 min, persisted across restarts
+- `kelly_bet()` div-by-zero on ask ≤ 0 or ≥ 1
+- `_ticker_game_date()` ValueError on malformed date strings in tickers
+- Double-down bypassing SL cooldown: `execute_addon()` now checks cooldown before placing
+- Scanner loop order: exits checked before new scan entries each cycle
+
+### Open — Model
+- **Baseball half-inning off-by-one** (`models/baseball_model.py` `prob_home_wins`): top-half case gives home one too few future half-innings (e.g. inning 5 top → home gets 4 future trips, should be 5). Diluted in practice since Markov is only 20% of consensus, but affects pure-Markov fallback paths.
+- **Tennis serve fallback to league average** (`models/serve_stats.py`): players with <50 recorded serve points fall back to ATP_AVG (0.64) / WTA_AVG (0.58), making the Markov chain treat them as symmetric regardless of score. Primary cause of 70–80% model prob zone's 40–47% actual win rate. Fix: wire `serve_win_prob_from_elo()` (already in `tennis_model.py`) as fallback instead of the constant.
+- **Tennis has no three-signal model**: `espn_win_prob` and `vegas_live_prob` are always 0.0 for tennis — no ESPN win prob endpoint exists for tennis, and no free Vegas source has been identified.
+- **Extra innings modeled as 50/50** (`models/baseball_model.py`): home teams win extra innings ~54% historically; post-2020 runner-on-2B rule significantly raises scoring probability. Not yet updated.
+
+### Open — Scanner / Executor
+- **Tennis markets lack upper-bound date filter** (`live_scanner.py`): currently only filters `occurrence_datetime < now`. A stale Kalshi market without a result could match a live ESPN player. Needs `< now + 1h` upper bound.
+- **Kelly fraction still 0.5** (`live_scanner.py`): code review recommended cutting to 0.25 until model calibration is confirmed on clean post-bug data. Still at 0.5.
+- **DraftKings provider ID hardcoded** (`live_scanner.py`): `provider.id == "100"` — if ESPN renumbers providers, Vegas signal silently drops to 0.0 with no warning or log entry.
+- **`_open_tickers` has no thread lock** (`order_executor.py`): Flask `/api/sell` runs in a separate thread from the scanner loop; concurrent read/write is unsynchronized.
+- **Stale pruning can remove unfilled buy orders** (`dashboard.py`): a newly placed order that hasn't appeared in `get_positions()` yet gets pruned from `_open_tickers`, causing a duplicate order next cycle.
+- **Doubleheader matching uses first game found** (`live_scanner.py` `find_baseball_game()`): ticker encodes game time (HHMM) but it's not used for disambiguation when a team plays twice in a day.
+
+### Open — Infrastructure
+- Odds API free tier is 500 req/month — warn if `arb_interval_sec` < 21600 (6h).
+- Performance tab for live mode does not account for exit P&L from `exits_live.jsonl`.
+- `min_model_prob` only filters `execute_live()` — arb signals have no `model_prob` field.
+- Duplicate baseball game cards in Live Now (Games tab): ESPN substring matching can return multiple hits for common city/team names. Needs deduplication by canonical team pair.
